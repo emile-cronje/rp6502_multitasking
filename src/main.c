@@ -849,13 +849,13 @@ void main()
     if (use_monitor == 1)
     {
         q_init(&test_q_1);        
-        scheduler_add(task_a, NULL);
-        scheduler_add(task_b, NULL);
+//        scheduler_add(task_a, NULL);
+  //      scheduler_add(task_b, NULL);
         scheduler_add(queue_test_producer, NULL);
         scheduler_add(queue_test_consumer, NULL);
 
-        scheduler_add(producer_task, NULL);
-        scheduler_add(consumer_task_1, NULL);
+        // scheduler_add(producer_task, NULL);
+        // scheduler_add(consumer_task_1, NULL);
         scheduler_add(task_monitor, NULL);        
   //      scheduler_add(consumer_task_2, NULL);
 //        scheduler_add(deep_stack_test, NULL);
