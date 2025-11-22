@@ -43,7 +43,8 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(C_SOURCES
   ${OS_SRC_DIR}/main.c
   ${OS_SRC_DIR}/scheduler.c
-  ${OS_SRC_DIR}/ringq.c  
+  ${OS_SRC_DIR}/ringq.c
+  ${OS_SRC_DIR}/string_helpers.c
 )
 set(ASM_SOURCES
   ${OS_SRC_DIR}/ctxswitch.s
@@ -81,6 +82,9 @@ set(ASM_SOURCES ${_FILTERED_ASM})
 
 # prevent host build
 set_source_files_properties(${C_SOURCES} ${ASM_SOURCES} PROPERTIES HEADER_FILE_ONLY TRUE)
+
+# Allow building the string helpers for host tests (compile with host toolchain)
+set_source_files_properties(${OS_SRC_DIR}/string_helpers.c PROPERTIES HEADER_FILE_ONLY FALSE)
 
 # ------------------------------------------------------------------
 # 5. Compile chain: C -> .s -> .o + os.asm -> os.o
@@ -195,3 +199,32 @@ get_target_property(LINKER_LANGUAGE rp6502_launch LINKER_LANGUAGE)
 message(STATUS "Raw binary : ${OUT_RAW}")
 message(STATUS "ROM image  : ${OUT_RP}")
 message(STATUS "Select 'rp6502_launch' as CMake launch target in VS Code.")
+
+# ------------------------------------------------------------------
+# 9. Host unit tests (built with the host compiler, not cc65)
+# ------------------------------------------------------------------
+option(BUILD_TESTS "Build host unit tests" ON)
+if(BUILD_TESTS)
+  enable_testing()
+
+  # Simple host-side test for string helpers. This builds with the host
+  # toolchain and links the helper implementation from src.
+  add_executable(test_string_helpers
+    tests/test_string_helpers.c
+    src/string_helpers.c
+  )
+  target_include_directories(test_string_helpers PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+  add_test(NAME string_helpers COMMAND test_string_helpers)
+  
+  # Build the host tests as part of the default 'all' target so they
+  # are built when the user runs a normal build.
+  add_custom_target(host_tests ALL DEPENDS test_string_helpers)
+  # Run CTest automatically after building the host_tests target so tests
+  # execute as part of a normal build. Use the configured CTest command and
+  # point it at the build directory.
+  add_custom_command(TARGET host_tests POST_BUILD
+    COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR} --output-on-failure
+    COMMENT "Running host tests via CTest"
+  )
+endif()

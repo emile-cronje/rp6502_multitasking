@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 /* Power-of-two capacity for cheap masking; keep in sync with main if changed. */
-#define Q_CAP 2048
+#define Q_CAP 2048u
 
 typedef struct {
     unsigned int buf[Q_CAP];

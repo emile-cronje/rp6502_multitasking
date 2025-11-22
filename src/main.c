@@ -3,6 +3,8 @@
 #include <stdlib.h> /* For malloc and free */
 
 const unsigned int BATCH_SIZE = 100u;    
+const unsigned int MAX_ITEM_COUNT = 2000;    
+const unsigned int use_monitor = 1u;    
 void scheduler_sleep(unsigned short ticks);
 void scheduler_yield(void);
 
@@ -58,6 +60,8 @@ static void mem_fluctuate_task(void *arg)
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include "string_helpers.h"
 #include "ringq.h"
 
 volatile unsigned int sleep_ms = 250;
@@ -108,41 +112,13 @@ unsigned int pseudo_random(unsigned int min_val, unsigned int max_val)
     return min_val + (random_seed % (max_val - min_val + 1u));
 }
 
-char *itoa_new(unsigned int val, char *buf)
-{
-    char tmp[6]; // max 5 digits + null for 16-bit unsigned
-    unsigned int i = 0;
-    unsigned int j = 0;
-
-    if (val == 0)
-    {
-        buf[0] = '0';
-        buf[1] = 0;
-        return buf;
-    }
-
-    // Extract digits in reverse order
-    while (val > 0)
-    {
-        tmp[i++] = (val % 10) + '0';
-        val /= 10;
-    }
-
-    // Reverse into destination buffer
-    while (i > 0)
-    {
-        buf[j++] = tmp[--i];
-    }
-
-    buf[j] = 0; // null terminator
-    return buf;
-}
+/* string_helper functions moved to src/string_helpers.c */
 
 void printValue(unsigned int value, char *description)
 {
     char buf[16];        
 
-    itoa_new(value, buf);
+    itoa_new(value, buf, sizeof(buf));
     puts(description);
     puts(buf);
 }
@@ -259,7 +235,7 @@ static RingQ test_q_2;
 volatile unsigned int test_sent_count = 0;
 volatile unsigned int test_recv_count = 0;
 volatile unsigned int test_producer_done = 0;
-volatile unsigned int test_total_item_count = 2000;
+volatile unsigned int test_total_item_count = 0;
 volatile unsigned int test_start_ticks = 0;
 volatile unsigned int test_end_ticks = 0;
 static unsigned int test_time_elapsed_ticks = 0;
@@ -272,6 +248,7 @@ static void queue_test_producer(void *arg)
     unsigned int i;
     static char buf[32];
     static char summary_buffer[128];    
+    size_t sb_pos = 0;
     unsigned int y;    
     unsigned int short_pct;
     (void)arg;
@@ -279,10 +256,13 @@ static void queue_test_producer(void *arg)
     for (;;) {
         q_init(&test_q_2);
 
-        test_run_count++;         
-        itoa_new(test_run_count, buf);
-        puts("Test run starting:");
-        puts(buf);
+        test_run_count++;                 
+
+        if (use_monitor == 0) {
+            itoa_new(test_run_count, buf, sizeof(buf));
+            puts("Test run starting:");
+            puts(buf);
+        }        
 
         /* Quick runtime sanity check: ensure test_q and q buffers don't overlap */
         {
@@ -296,13 +276,14 @@ static void queue_test_producer(void *arg)
             }
         }
 
-        /* Randomize CPU frequency for this run (simulate 500kHz to 2MHz) */
-        /* Generate random test size (1000-10000) for this run */
-//        totalItemCount = pseudo_random(1000u, 8000u);
+        test_total_item_count = pseudo_random(100u, MAX_ITEM_COUNT);
 
-        itoa_new(test_total_item_count, buf);
-        puts("Test Queue: total items:");
-        puts(buf);
+        if (use_monitor == 0)
+        {
+            itoa_new(test_total_item_count, buf, sizeof(buf));
+            puts("Test Queue: total items:");
+            puts(buf);
+        }        
 
         test_sent_count = 0;
         test_recv_count = 0;
@@ -333,30 +314,26 @@ static void queue_test_producer(void *arg)
                 test_sent_sum += (unsigned long)i;
                 i++;
 
-                // if (test_sent_count % 100 == 0u)
-                // {
-                //     itoa_new(test_run_count, buf);
-                //     puts("Test run:");
-                //     puts(buf);
+                if (test_sent_count % 500 == 0u)
+                {
+                    itoa_new(test_run_count, buf, sizeof(buf));
+                    puts("\r\n");                    
+                    puts("Test run:");
+                    puts(buf);
 
-                //     itoa_new(test_total_item_count, buf);
-                //     puts("Total item count:");
-                //     puts(buf);
+                    itoa_new(test_total_item_count, buf, sizeof(buf));
+                    puts("Total item count:");
+                    puts(buf);
 
-                //     itoa_new(test_recv_count, buf);
-                //     puts("Received count:");
-                //     puts(buf);
+                    itoa_new(test_recv_count, buf, sizeof(buf));
+                    puts("Received count:");
+                    puts(buf);
 
-                //     // itoa_new(i, buf);
-                //     // puts("Item index:");
-                //     // puts(buf);
-
-                //     short_pct = (unsigned int)(((unsigned long)test_recv_count * 100UL) / (unsigned long)test_total_item_count);                    
-                //     itoa_new(short_pct, buf);
-                //     puts("Completed %:");
-                //     puts(buf);
-                //     puts("\r\n");                    
-                // }                
+                    short_pct = (unsigned int)(((unsigned long)test_recv_count * 100UL) / (unsigned long)test_total_item_count);                    
+                    itoa_new(short_pct, buf, sizeof(buf));
+                    puts("Completed %:");
+                    puts(buf);
+                }                
             }
 
             /* After sending a batch, yield a few times to let consumer drain */
@@ -367,11 +344,11 @@ static void queue_test_producer(void *arg)
             while (q_count(&test_q_2) > Q_LOW_WATERMARK)
                 scheduler_yield();
 
-            // itoa_new(i, buf);
+            // itoa_new(i, buf, sizeof(buf));
             // puts("After batch item index:");
             // puts(buf);
 
-            // itoa_new(test_recv_count, buf);
+            // itoa_new(test_recv_count, buf, sizeof(buf));
             // puts("After batch received count:");
             // puts(buf);            
         }
@@ -382,70 +359,66 @@ static void queue_test_producer(void *arg)
             scheduler_yield();
         }
 
-        itoa_new(test_sent_count, buf);
-        puts("Queue test: producer sent:");
-        puts(buf);
-        itoa_new(test_recv_count, buf);
-        puts("Queue test: consumer received:");
-        puts(buf);
-
-        if (test_sent_count == test_recv_count)
-            puts("Queue test: PASS (count match)\r\n");
-
-        if (test_sent_sum == test_recv_sum)
-            puts("Queue test: PASS (sum match)\r\n");
-        else {
-            puts("Queue test: FAIL\r\n");
-            puts("Details: sent_sum = ");
-            itoa_new((unsigned int)(test_sent_sum & 0xFFFF), buf);
-            puts(buf);
-            puts(" recv_sum = ");
-            itoa_new((unsigned int)(test_recv_sum & 0xFFFF), buf);
-            puts(buf);
-        }
-
-        /* Record elapsed ticks for this run and print when sums match */
-        test_end_ticks = scheduler_get_ticks();
-        test_time_elapsed_ticks = (unsigned int)(test_end_ticks - test_start_ticks);
-        if (test_sent_sum == test_recv_sum) {
-            puts("Elapsed ticks:");
-            itoa_new(test_time_elapsed_ticks, buf);
-            puts(buf);
-            puts("\r\n");
-        }
-
-        if (test_sent_count == test_total_item_count
-            && test_recv_count == test_total_item_count
-            && q_is_empty(&test_q_2))
+        if (use_monitor == 0)
         {
-            itoa_new(test_total_item_count, buf);
-            strcat(summary_buffer, "Test total:");
-            strcat(summary_buffer, buf);
-            strcat(summary_buffer, " ");
+                itoa_new(test_sent_count, buf, sizeof(buf));
+            puts("\r\nQueue test: producer sent:");
+            puts(buf);
+                itoa_new(test_recv_count, buf, sizeof(buf));
+            puts("Queue test: consumer received:");
+            puts(buf);
 
-            itoa_new(test_sent_count, buf);
-            strcat(summary_buffer, "Test sent:");
-            strcat(summary_buffer, buf);
-            strcat(summary_buffer, " ");
+            if (test_sent_count == test_recv_count)
+                puts("Queue test: PASS (count match)");
 
-            itoa_new(test_recv_count, buf);
-            strcat(summary_buffer, "Test recv:");
-            strcat(summary_buffer, buf);
-            strcat(summary_buffer, " ");
-
-            /* Completion percentage (sent/total) */
-            {
-                unsigned int pct = 0u;
-                if (test_total_item_count) {
-                    pct = (unsigned int)(((unsigned long)test_sent_count * 100UL) / (unsigned long)test_total_item_count);
-                }
-                itoa_new(pct, buf);
-                strcat(summary_buffer, "Completed:");
-                strcat(summary_buffer, buf);
-                strcat(summary_buffer, "%\r\n");
+            if (test_sent_sum == test_recv_sum)
+                puts("Queue test: PASS (sum match)");
+            else {
+                puts("Queue test: FAIL\r\n");
+                puts("Details: sent_sum = ");
+                itoa_new((unsigned int)(test_sent_sum & 0xFFFF), buf, sizeof(buf));
+                puts(buf);
+                puts(" recv_sum = ");
+                itoa_new((unsigned int)(test_recv_sum & 0xFFFF), buf, sizeof(buf));
+                puts(buf);
             }
 
-            strcat(summary_buffer, "Test:PASS\r\n");
+            /* Record elapsed ticks for this run and print when sums match */
+            // test_end_ticks = scheduler_get_ticks();
+            // test_time_elapsed_ticks = (unsigned int)(test_end_ticks - test_start_ticks);
+            // if (test_sent_sum == test_recv_sum) {
+            //     puts("Elapsed ticks:");
+            //     itoa_new(test_time_elapsed_ticks, buf);
+            //     puts(buf);
+            //     puts("\r\n");
+            // }
+
+            if (test_sent_count == test_total_item_count
+                && test_recv_count == test_total_item_count
+                && q_is_empty(&test_q_2))
+            {
+                sb_pos = 0;
+                itoa_new(test_total_item_count, buf, sizeof(buf));
+                append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test total:%s ", buf);
+
+                itoa_new(test_sent_count, buf, sizeof(buf));
+                append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test sent:%s ", buf);
+                
+                itoa_new(test_recv_count, buf, sizeof(buf));
+                append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test recv:%s ", buf);
+
+                /* Completion percentage (sent/total) */
+                {
+                    unsigned int pct = 0u;
+                    if (test_total_item_count) {
+                        pct = (unsigned int)(((unsigned long)test_sent_count * 100UL) / (unsigned long)test_total_item_count);
+                    }
+                    itoa_new(pct, buf, sizeof(buf));
+                    append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Completed:%s%%\r\n", buf);
+                }
+
+                append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test:PASS\r\n");
+            }
         }
 
         for (i = 0; i < 1000u; ++i)
@@ -564,6 +537,7 @@ void task_monitor(void *arg)
     char num_buffer[8];
     static char summary_buffer[512];
     char bar[32];
+    size_t sb_pos = 0;
     unsigned int fill;
     unsigned int mem_used;
     unsigned long pct32;
@@ -591,10 +565,10 @@ void task_monitor(void *arg)
 
     for (;;)
     {
-        if (test_run_count == 0)
-        {
-            continue;
-        }
+        // if (test_run_count == 0)
+        // {
+        //     continue;
+        // }
 
         scheduler_sleep(1000);
         toggle_counter++;
@@ -603,32 +577,23 @@ void task_monitor(void *arg)
             mem_fluctuate_active = !mem_fluctuate_active;
         }
         puts("------------------------\r\n");
-        strcpy(summary_buffer, "--- Task Summary ---\r\n");
+        sb_pos = 0;
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "--- Task Summary ---\r\n");
 
-        itoa_new(task_a_counter, num_buffer);
-        strcat(summary_buffer, "A:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " ");
+        itoa_new(task_a_counter, num_buffer, sizeof(num_buffer));
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "A:%s ", num_buffer);
 
-        itoa_new(task_b_counter, num_buffer);
-        strcat(summary_buffer, "\r\nB:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " ");
+        itoa_new(task_b_counter, num_buffer, sizeof(num_buffer));
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "\r\nB:%s ", num_buffer);
 
-        itoa_new(produced_item, num_buffer);
-        strcat(summary_buffer, "\r\nProduced item:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " ");
+        itoa_new(produced_item, num_buffer, sizeof(num_buffer));
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "\r\nProduced item:%s ", num_buffer);
 
-        itoa_new(consumed_item_1, num_buffer);
-        strcat(summary_buffer, "\r\nConsumed item 1:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " ");
+        itoa_new(consumed_item_1, num_buffer, sizeof(num_buffer));
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "\r\nConsumed item 1:%s ", num_buffer);
 
-        itoa_new(consumed_item_2, num_buffer);
-        strcat(summary_buffer, "\r\nConsumed item 2:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " \r\n");
+        itoa_new(consumed_item_2, num_buffer, sizeof(num_buffer));
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "\r\nConsumed item 2:%s \r\n", num_buffer);
 
         /* Throttle producer/consumer based on queue fill level. */
         fill = q_count(&test_q_1);
@@ -663,15 +628,9 @@ void task_monitor(void *arg)
             else if (sleep_ms_consumer < CONS_SLEEP_BASE) sleep_ms_consumer++;
         }
 
-        itoa_new(sleep_ms_producer, num_buffer);
-        strcat(summary_buffer, "Prod sleep_ms:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " ");
-
-        itoa_new(sleep_ms_consumer, num_buffer);
-        strcat(summary_buffer, "Cons sleep_ms:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " \r\n");
+        itoa_new(sleep_ms_producer, num_buffer, sizeof(num_buffer));
+        itoa_new(sleep_ms_consumer, pctbuf, sizeof(pctbuf));
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Prod sleep_ms:%s Cons sleep_ms:%s \r\n", num_buffer, pctbuf);
 
         /* Memory usage indicator (approximate): scheduler + queue footprint + simulated fluctuation */
         mem_used = (unsigned int)(sizeof(test_q_1) + scheduler_memory_usage());
@@ -685,17 +644,10 @@ void task_monitor(void *arg)
             }
         }
         pct32 = ((unsigned long)mem_used * 100UL) / ((unsigned long)(RAM_TOTAL_BYTES ? RAM_TOTAL_BYTES : 1u));
-        itoa_new(mem_used, num_buffer);
-        strcat(summary_buffer, "Mem used:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " ");
-        itoa_new((unsigned int)pct32, num_buffer);
-        strcat(summary_buffer, "(");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, "% ) ");
+        itoa_new(mem_used, num_buffer, sizeof(num_buffer));
+        itoa_new((unsigned int)pct32, pctbuf, sizeof(pctbuf));
         make_bar((unsigned int)pct32, bar, 20);
-        strcat(summary_buffer, bar);
-        strcat(summary_buffer, "\r\n");
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Mem used:%s (%s%% ) %s\r\n", num_buffer, pctbuf, bar);
 
         /* CPU usage metric: percent and raw tick counters */
         cpu_pct = scheduler_cpu_usage_percent();
@@ -709,14 +661,9 @@ void task_monitor(void *arg)
         // strcat(summary_buffer, bar);
         // strcat(summary_buffer, "\r\n");
         /* Show raw tick counters for diagnostics */
-        itoa_new((unsigned int)(cpu_active & 0xFFFF), cpu_buf); /* low 16 bits */
-        strcat(summary_buffer, "CPU active ticks:");
-        strcat(summary_buffer, cpu_buf);
-        strcat(summary_buffer, " ");
-        itoa_new((unsigned int)(cpu_total & 0xFFFF), cpu_buf); /* low 16 bits */
-        strcat(summary_buffer, "CPU total ticks:");
-        strcat(summary_buffer, cpu_buf);
-        strcat(summary_buffer, "\r\n");
+        itoa_new((unsigned int)(cpu_active & 0xFFFF), cpu_buf, sizeof(cpu_buf)); /* low 16 bits */
+        itoa_new((unsigned int)(cpu_total & 0xFFFF), pctbuf, sizeof(pctbuf)); /* low 16 bits */
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "CPU active ticks:%s CPU total ticks:%s\r\n", cpu_buf, pctbuf);
 
         /* Runtime stack usage (per-task + total) */
         {
@@ -785,45 +732,25 @@ void task_monitor(void *arg)
             for (ti = 0; ti < SCHED_MAX_TASKS; ++ti) {
                 used = used_arr[ti];
                 if (used == 0) continue;
-                itoa_new(used, num_buffer);
-                strcat(summary_buffer, "T");
-                /* small convert of ti to string */
-                tnum[0] = '0' + (char)(ti % 10);
-                tnum[1] = 0;
-                strcat(summary_buffer, tnum);
-                strcat(summary_buffer, ":");
-                strcat(summary_buffer, num_buffer);
-                strcat(summary_buffer, "(");
-                /* append high-water mark */
-                itoa_new(scheduler_task_max_used(ti), num_buffer);
-                strcat(summary_buffer, num_buffer);
-                strcat(summary_buffer, ") ");
+                itoa_new(used, num_buffer, sizeof(num_buffer));
+                itoa_new(scheduler_task_max_used(ti), pctbuf, sizeof(pctbuf));
+                append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "T%d:%s(%s) ", ti, num_buffer, pctbuf);
             }
-            strcat(summary_buffer, "\r\n");
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "\r\n");
         }
 
     /* Append queue metrics into the summary and print everything as one block */
     {
         unsigned int qc = q_count(&test_q_1);
         unsigned int qf = q_space_free(&test_q_1);
-        itoa_new(qc, num_buffer);
-        strcat(summary_buffer, "Q count:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, "\r\n");
-        itoa_new(qf, num_buffer);
-        strcat(summary_buffer, "Q free:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, "\r\n");
+        itoa_new(qc, num_buffer, sizeof(num_buffer));
+        itoa_new(qf, pctbuf, sizeof(pctbuf));
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Q count:%s\r\nQ free:%s\r\n", num_buffer, pctbuf);
 
         /* Also show test_q (self-test) counts */
-        itoa_new(q_count(&test_q_2), num_buffer);
-        strcat(summary_buffer, "TestQ count:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, " ");
-        itoa_new(q_space_free(&test_q_2), num_buffer);
-        strcat(summary_buffer, "TestQ free:");
-        strcat(summary_buffer, num_buffer);
-        strcat(summary_buffer, "\r\n");
+        itoa_new(q_count(&test_q_2), num_buffer, sizeof(num_buffer));
+        itoa_new(q_space_free(&test_q_2), pctbuf, sizeof(pctbuf));
+        append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "TestQ count:%s TestQ free:%s\r\n", num_buffer, pctbuf);
     }
 
     /* Append queue-test results (producer/consumer self-test) */
@@ -841,54 +768,27 @@ void task_monitor(void *arg)
             /* Show items remaining on producer and consumer queues */
             prod_q_items_count = q_count(&test_q_2);
             cons_q_received_count = test_recv_count;
-            itoa_new(prod_q_items_count, num_buffer);
-            strcat(summary_buffer, "Producer Q items remaining:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, " ");
-            itoa_new(cons_q_received_count, num_buffer);
-            strcat(summary_buffer, "Consumer items received:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, "\r\n");
-
-            itoa_new(test_total_item_count, num_buffer);
-            strcat(summary_buffer, "Total items:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, "\r\n");
-
-            itoa_new(cons_q_received_count, num_buffer);
-            strcat(summary_buffer, "Received count:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, "\r\n");
+            itoa_new(prod_q_items_count, num_buffer, sizeof(num_buffer));
+            itoa_new(cons_q_received_count, pctbuf, sizeof(pctbuf));
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Producer Q items remaining:%s Consumer items received:%s\r\n", num_buffer, pctbuf);
+            itoa_new(test_total_item_count, num_buffer, sizeof(num_buffer));
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Total items:%s\r\n", num_buffer);
+            itoa_new(cons_q_received_count, num_buffer, sizeof(num_buffer));
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Received count:%s\r\n", num_buffer);
 
             short_pct = (unsigned int)(((unsigned long)cons_q_received_count * 100UL) / (unsigned long)test_total_item_count);
-            //short_pct = (unsigned int)(cons_q_received_count / test_total_items) * 100;            
-            itoa_new(short_pct, num_buffer);
-            strcat(summary_buffer, "Completed:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, "%\r\n");
-
-            itoa_new(test_run_count, num_buffer);
-            strcat(summary_buffer, "Test run:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, "\r\n");
+            itoa_new(short_pct, num_buffer, sizeof(num_buffer));
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Completed:%s%%\r\n", num_buffer);
+            itoa_new(test_run_count, num_buffer, sizeof(num_buffer));
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test run:%s\r\n", num_buffer);
         }
 
         if (test_sent_count == test_total_item_count && test_recv_count == test_total_item_count && q_is_empty(&test_q_2))
         {
-            itoa_new(test_total_item_count, num_buffer);
-            strcat(summary_buffer, "Test total:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, " ");
-
-            itoa_new(test_sent_count, num_buffer);
-            strcat(summary_buffer, "Test sent:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, " ");
-
-            itoa_new(test_recv_count, num_buffer);
-            strcat(summary_buffer, "Test recv:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, " ");
+            itoa_new(test_total_item_count, num_buffer, sizeof(num_buffer));
+            itoa_new(test_sent_count, pctbuf, sizeof(pctbuf));
+            itoa_new(test_recv_count, cpu_buf, sizeof(cpu_buf));
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test total:%s Test sent:%s Test recv:%s ", num_buffer, pctbuf, cpu_buf);
 
             /* Completion percentage (sent/total) */
             {
@@ -896,31 +796,25 @@ void task_monitor(void *arg)
                 if (test_total_item_count) {
                     pct = (unsigned int)(((unsigned long)test_sent_count * 100UL) / (unsigned long)test_total_item_count);
                 }
-                itoa_new(pct, num_buffer);
-                strcat(summary_buffer, "Completed:");
-                strcat(summary_buffer, num_buffer);
-                strcat(summary_buffer, "%\r\n");
+                itoa_new(pct, num_buffer, sizeof(num_buffer));
+                append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Completed:%s%%\r\n", num_buffer);
             }
 
             /* Elapsed time in ticks and estimated throughput (items per 100 ticks) */
-            itoa_new(elapsed, num_buffer);
-            strcat(summary_buffer, "Ticks:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, " ");
+            itoa_new(elapsed, num_buffer, sizeof(num_buffer));
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Ticks:%s ", num_buffer);
             
             if (elapsed > 0) {
                 throughput = (test_recv_count * 100u) / elapsed;
             }
-            itoa_new(throughput, num_buffer);
-            strcat(summary_buffer, "Items/100tk:");
-            strcat(summary_buffer, num_buffer);
-            strcat(summary_buffer, " ");
+            itoa_new(throughput, num_buffer, sizeof(num_buffer));
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Items/100tk:%s ", num_buffer);
 
-            strcat(summary_buffer, "Test:PASS\r\n");
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test:PASS\r\n");
         }
         else
         {
-            strcat(summary_buffer, "Test:RUNNING\r\n");
+            append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test:RUNNING\r\n");
         }
     }
 
@@ -952,17 +846,27 @@ void main()
         pseudo_random(0u, 1u);
     }
 
-//    q_init(&test_q_1);    
-    // scheduler_add(task_a, NULL);
-    // scheduler_add(task_b, NULL);
-  //  scheduler_add(producer_task, NULL);
-    //scheduler_add(consumer_task_1, NULL);
-    // scheduler_add(consumer_task_2, NULL);
-    //scheduler_add(deep_stack_test, NULL);
+    if (use_monitor == 1)
+    {
+        q_init(&test_q_1);        
+        scheduler_add(task_a, NULL);
+        scheduler_add(task_b, NULL);
+        scheduler_add(queue_test_producer, NULL);
+        scheduler_add(queue_test_consumer, NULL);
 
-    scheduler_add(queue_test_producer, NULL);
-    scheduler_add(queue_test_consumer, NULL);
-    //scheduler_add(task_monitor, NULL);
+        scheduler_add(producer_task, NULL);
+        scheduler_add(consumer_task_1, NULL);
+        scheduler_add(task_monitor, NULL);        
+  //      scheduler_add(consumer_task_2, NULL);
+//        scheduler_add(deep_stack_test, NULL);
+    }
+    else
+    {
+        scheduler_add(queue_test_producer, NULL);
+        scheduler_add(queue_test_consumer, NULL);
+//        scheduler_add(queue_test_consumer, NULL);        
+    }
+
 //    scheduler_add_once(task_once, NULL);
 //    scheduler_add(mem_fluctuate_task, NULL);
     scheduler_run();
