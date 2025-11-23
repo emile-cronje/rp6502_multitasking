@@ -3,6 +3,23 @@
 
 #include <stdint.h>
 
+/* Prefer C11 atomics when available; fall back to a volatile spin variable
+ * for toolchains that don't provide <stdatomic.h> (e.g. cc65). Use the
+ * preprocessor to detect availability when possible. */
+#if defined(__has_include)
+#  if __has_include(<stdatomic.h>)
+#    include <stdatomic.h>
+#    define RQ_HAVE_STDATOMIC 1
+#  endif
+#endif
+
+#ifndef RQ_HAVE_STDATOMIC
+#  if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112) && !defined(__STDC_NO_ATOMICS__)
+#    include <stdatomic.h>
+#    define RQ_HAVE_STDATOMIC 1
+#  endif
+#endif
+
 /* Power-of-two capacity for cheap masking; keep in sync with main if changed. */
 #define Q_CAP 2048u
 
@@ -10,6 +27,14 @@ typedef struct {
     unsigned int buf[Q_CAP];
     volatile unsigned int head; /* next write */
     volatile unsigned int tail; /* next read  */
+#ifdef RQ_HAVE_STDATOMIC
+    atomic_flag lock; /* atomic spinlock */
+#else
+    /* Fallback for non-C11 toolchains: simple volatile flag. This is not
+     * atomic; it relies on single-core / interrupt-disabled usage or higher
+     * level synchronization. */
+    volatile unsigned int lock; /* 0 = unlocked, 1 = locked */
+#endif
 } RingQ;
 
 void q_init(RingQ *q);

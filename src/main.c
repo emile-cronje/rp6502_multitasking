@@ -143,6 +143,9 @@ char *make_bar(unsigned int pct, char *buf, int width)
     return buf;
 }
 
+/* forward declare fail_halt (defined after test globals so it can print them) */
+static void fail_halt(const char *msg, unsigned int a, unsigned int b);
+
 static void task_a(void *arg)
 {
     while (1) {
@@ -243,6 +246,98 @@ volatile unsigned long test_sent_sum = 0UL;
 volatile unsigned long test_recv_sum = 0UL;
 volatile unsigned int test_run_count = 0;
 
+/* Instrumentation totals for ringq operations (incremented in ringq.c). */
+volatile unsigned long ringq_total_pushed = 0UL;
+volatile unsigned long ringq_total_popped = 0UL;
+
+/* Debug hook invoked from ringq.c on invariant failures. */
+void ringq_debug_fail(const char *msg, unsigned int a, unsigned int b)
+{
+    /* Reuse fail_halt to print extended state and halt */
+    fail_halt(msg, a, b);
+}
+
+/* Sequence instrumentation: monotonic sequence written by producer and
+   recorded by consumer to help detect extra/duplicate pops. */
+volatile unsigned long test_seq = 0UL;
+volatile unsigned int recv_log[64];
+volatile unsigned int recv_log_pos = 0u;
+
+/* Full fail_halt implementation prints extended runtime state then halts. */
+static void fail_halt(const char *msg, unsigned int a, unsigned int b)
+{
+    char numbuf[32];
+    unsigned int tail_idx;
+    unsigned int val_tail;
+    unsigned int prev_idx;
+
+    puts("*** FATAL: "); puts(msg); puts("\r\n");
+
+    puts("args: ");
+    itoa_new(a, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+    itoa_new(b, numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
+
+    puts("run:"); itoa_new(test_run_count, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+    puts("ticks:"); itoa_new(scheduler_get_ticks(), numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
+
+    puts("total_items:"); itoa_new(test_total_item_count, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+    puts("sent_count:"); itoa_new(test_sent_count, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+    puts("recv_count:"); itoa_new(test_recv_count, numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
+
+    puts("sent_sum_lo:"); itoa_new((unsigned int)(test_sent_sum & 0xFFFFu), numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+    puts("recv_sum_lo:"); itoa_new((unsigned int)(test_recv_sum & 0xFFFFu), numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
+
+    /* Test queue state */
+    puts("test_q_2 head:"); itoa_new(test_q_2.head, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+    puts("tail:"); itoa_new(test_q_2.tail, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+    puts("count:"); itoa_new(q_count(&test_q_2), numbuf, sizeof(numbuf)); puts(numbuf); puts(" free:"); itoa_new(q_space_free(&test_q_2), numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
+
+    if (!q_is_empty(&test_q_2)) {
+        tail_idx = test_q_2.tail;
+        val_tail = test_q_2.buf[tail_idx];
+        itoa_new(val_tail, numbuf, sizeof(numbuf)); puts("q2.buf[tail]:"); puts(numbuf); puts(" ");
+        prev_idx = (test_q_2.head - 1) & (Q_CAP - 1);
+        itoa_new(test_q_2.buf[prev_idx], numbuf, sizeof(numbuf)); puts("q2.buf[head-1]:"); puts(numbuf); puts("\r\n");
+    }
+
+    /* Print a small window of consecutive queue entries starting at tail. */
+    {
+        unsigned int idx = test_q_2.tail;
+        unsigned int i;
+        puts("q2.buf[window 8]:");
+        for (i = 0; i < 8u; ++i) {
+            unsigned int v = test_q_2.buf[idx];
+            itoa_new(v, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+            idx = (idx + 1) & (Q_CAP - 1);
+        }
+        puts("\r\n");
+    }
+
+    /* Print recent received values from consumer log */
+    {
+        unsigned int rp = recv_log_pos;
+        unsigned int i;
+        puts("recent_recv[8]:");
+        for (i = 0; i < 8u; ++i) {
+            unsigned int idx = (unsigned int)((rp - 8u + i) & 63u);
+            unsigned int v = recv_log[idx];
+            itoa_new(v, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+        }
+        puts("\r\n");
+    }
+
+    /* Print global instrumentation totals */
+    puts("ringq_total_pushed:"); itoa_new((unsigned int)(ringq_total_pushed & 0xFFFFFFFFu), numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
+    puts("ringq_total_popped:"); itoa_new((unsigned int)(ringq_total_popped & 0xFFFFFFFFu), numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
+
+#if defined(__CC65__)
+    /* disable interrupts to keep system halted */
+    __asm__("sei");
+#endif
+
+    for (;;) { /* halt */ }
+}
+
 static void queue_test_producer(void *arg)
 {
     unsigned int i;
@@ -288,6 +383,7 @@ static void queue_test_producer(void *arg)
         test_sent_count = 0;
         test_recv_count = 0;
         test_producer_done = 0;
+        test_seq = 0UL; /* reset per-run sequence counter */
         test_start_ticks = scheduler_get_ticks();
         test_sent_sum = 0UL;
         test_recv_sum = 0UL;
@@ -304,36 +400,39 @@ static void queue_test_producer(void *arg)
             /* Send a batch without yielding between each push to reduce context switches */
             while (i < batch_end)
             {
-                /* wait until we can push one item */
-                while (!q_push(&test_q_2, i)) {
-                    /* let consumer run */
-                    scheduler_yield();
+                /* wait until we can push one item (push monotonic sequence for tracing) */
+                {
+                    unsigned int seq = (unsigned int)(++test_seq);
+                    while (!q_push(&test_q_2, seq)) {
+                        /* let consumer run */
+                        scheduler_yield();
+                    }
+
+                    test_sent_count = i + 1;
+                    test_sent_sum += (unsigned long)seq;
+                    i++;
                 }
 
-                test_sent_count = i + 1;
-                test_sent_sum += (unsigned long)i;
-                i++;
+                // if (test_sent_count % 500 == 0u)
+                // {
+                //     itoa_new(test_run_count, buf, sizeof(buf));
+                //     puts("\r\n");                    
+                //     puts("Test run:");
+                //     puts(buf);
 
-                if (test_sent_count % 500 == 0u)
-                {
-                    itoa_new(test_run_count, buf, sizeof(buf));
-                    puts("\r\n");                    
-                    puts("Test run:");
-                    puts(buf);
+                //     itoa_new(test_total_item_count, buf, sizeof(buf));
+                //     puts("Total item count:");
+                //     puts(buf);
 
-                    itoa_new(test_total_item_count, buf, sizeof(buf));
-                    puts("Total item count:");
-                    puts(buf);
+                //     itoa_new(test_recv_count, buf, sizeof(buf));
+                //     puts("Received count:");
+                //     puts(buf);
 
-                    itoa_new(test_recv_count, buf, sizeof(buf));
-                    puts("Received count:");
-                    puts(buf);
-
-                    short_pct = (unsigned int)(((unsigned long)test_recv_count * 100UL) / (unsigned long)test_total_item_count);                    
-                    itoa_new(short_pct, buf, sizeof(buf));
-                    puts("Completed %:");
-                    puts(buf);
-                }                
+                //     short_pct = (unsigned int)(((unsigned long)test_recv_count * 100UL) / (unsigned long)test_total_item_count);                    
+                //     itoa_new(short_pct, buf, sizeof(buf));
+                //     puts("Completed %:");
+                //     puts(buf);
+                // }                
             }
 
             /* After sending a batch, yield a few times to let consumer drain */
@@ -352,6 +451,10 @@ static void queue_test_producer(void *arg)
             // puts("After batch received count:");
             // puts(buf);            
         }
+
+        /* Signal consumer that producer has finished enqueuing for this run,
+         * then wait for the consumer to drain the remaining items. */
+        test_producer_done = 1;
 
         /* Wait for consumer to finish draining the queue before restarting */
         while (!q_is_empty(&test_q_2))
@@ -439,6 +542,10 @@ static void queue_test_consumer(void *arg)
         for (;;) {
             /* Try to pop, if empty yield so producer can run */
             while (q_pop(&test_q_2, &v)) {
+                /* record received value into a small circular log for diagnostics */
+                recv_log[recv_log_pos & 63u] = v;
+                recv_log_pos++;
+
                 test_recv_count++;
                 test_recv_sum += (unsigned long)v;
                 /* Debug: print first few pops and periodic progress */
@@ -459,6 +566,19 @@ static void queue_test_consumer(void *arg)
                 break;
             }
             scheduler_yield();
+        }
+
+        /* Diagnostics: detect corruption or unexpected counts/sums and halt */
+        if (test_total_item_count != 0) {
+            if (test_recv_count > test_total_item_count) {
+                fail_halt("Queue test: FATAL - recv_count > total_items", test_recv_count, test_total_item_count);
+            }
+
+            if ((unsigned int)(test_recv_sum & 0xFFFFu) > (unsigned int)(test_sent_sum & 0xFFFFu)) {
+                fail_halt("Queue test: FATAL - recv_sum_low16 > sent_sum_low16",
+                          (unsigned int)(test_recv_sum & 0xFFFFu),
+                          (unsigned int)(test_sent_sum & 0xFFFFu));
+            }
         }
 
         /* Wait for producer to set test_producer_done = 0 (restart signal) */
@@ -783,7 +903,9 @@ void task_monitor(void *arg)
             append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "Test run:%s\r\n", num_buffer);
         }
 
-        if (test_sent_count == test_total_item_count && test_recv_count == test_total_item_count && q_is_empty(&test_q_2))
+        if (test_sent_count == test_total_item_count
+            && test_recv_count == test_total_item_count
+            && q_is_empty(&test_q_2))
         {
             itoa_new(test_total_item_count, num_buffer, sizeof(num_buffer));
             itoa_new(test_sent_count, pctbuf, sizeof(pctbuf));
@@ -846,9 +968,12 @@ void main()
         pseudo_random(0u, 1u);
     }
 
+    /* Ensure test queues are initialized regardless of monitor mode */
+    q_init(&test_q_1);
+    q_init(&test_q_2);
+
     if (use_monitor == 1)
     {
-        q_init(&test_q_1);        
 //        scheduler_add(task_a, NULL);
   //      scheduler_add(task_b, NULL);
         scheduler_add(queue_test_producer, NULL);
