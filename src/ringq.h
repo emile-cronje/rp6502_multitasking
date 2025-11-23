@@ -35,6 +35,13 @@ typedef struct {
      * level synchronization. */
     volatile unsigned int lock; /* 0 = unlocked, 1 = locked */
 #endif
+    /* Lightweight debug invariants: running checksum of contents and
+     * last pushed sequence value (useful when producer writes monotonic
+     * sequence numbers). Kept small to reduce memory impact. */
+    unsigned long debug_sum;
+    unsigned int debug_last_seq;
+    /* Per-slot guard pattern to detect overwrites/zeroing of buffer slots. */
+    unsigned short guard[Q_CAP];
 } RingQ;
 
 void q_init(RingQ *q);

@@ -240,6 +240,7 @@ volatile unsigned int test_recv_count = 0;
 volatile unsigned int test_producer_done = 0;
 volatile unsigned int test_total_item_count = 0;
 volatile unsigned int test_start_ticks = 0;
+volatile unsigned int test_consumer_ready = 0;
 volatile unsigned int test_end_ticks = 0;
 static unsigned int test_time_elapsed_ticks = 0;
 volatile unsigned long test_sent_sum = 0UL;
@@ -371,9 +372,15 @@ static void queue_test_producer(void *arg)
             }
         }
 
+        /* Wait for consumer to be ready for the next run */
+        test_consumer_ready = 0;
+        while (test_consumer_ready == 0) {
+            scheduler_yield();
+        }
+
         test_total_item_count = pseudo_random(100u, MAX_ITEM_COUNT);
 
-        if (use_monitor == 0)
+        if (use_monitor == 1)
         {
             itoa_new(test_total_item_count, buf, sizeof(buf));
             puts("Test Queue: total items:");
@@ -462,6 +469,20 @@ static void queue_test_producer(void *arg)
             scheduler_yield();
         }
 
+        /* Perform final validation in the producer, which is the only task
+         * that can safely determine when a run is complete. */
+        if (test_total_item_count != 0) {
+            if (test_recv_count > test_total_item_count) {
+                fail_halt("Queue test: FATAL - recv_count > total_items", test_recv_count, test_total_item_count);
+            }
+
+            if ((unsigned int)(test_recv_sum & 0xFFFFu) > (unsigned int)(test_sent_sum & 0xFFFFu)) {
+                fail_halt("Queue test: FATAL - recv_sum_low16 > sent_sum_low16",
+                          (unsigned int)(test_recv_sum & 0xFFFFu),
+                          (unsigned int)(test_sent_sum & 0xFFFFu));
+            }
+        }
+
         if (use_monitor == 0)
         {
                 itoa_new(test_sent_count, buf, sizeof(buf));
@@ -536,9 +557,12 @@ static void queue_test_consumer(void *arg)
     (void)arg;
 
     for (;;) {
-        test_recv_count = 0;
-
-        /* Consume all items until queue is empty and producer is done */
+        /* Wait for the producer to signal the start of a new run. */
+        while (test_producer_done != 0) {
+            scheduler_yield();
+        }
+        /* Now that a new run has begun, signal that we are ready. */
+        test_consumer_ready = 1;
         for (;;) {
             /* Try to pop, if empty yield so producer can run */
             while (q_pop(&test_q_2, &v)) {
@@ -562,29 +586,12 @@ static void queue_test_consumer(void *arg)
             }
             /* Check if done: producer finished AND queue is empty */
             if (test_producer_done && q_is_empty(&test_q_2)) {
-//                puts("Consumer: detected producer done and empty queue");
+                puts("Consumer: detected producer done and empty queue");
                 break;
             }
             scheduler_yield();
         }
 
-        /* Diagnostics: detect corruption or unexpected counts/sums and halt */
-        if (test_total_item_count != 0) {
-            if (test_recv_count > test_total_item_count) {
-                fail_halt("Queue test: FATAL - recv_count > total_items", test_recv_count, test_total_item_count);
-            }
-
-            if ((unsigned int)(test_recv_sum & 0xFFFFu) > (unsigned int)(test_sent_sum & 0xFFFFu)) {
-                fail_halt("Queue test: FATAL - recv_sum_low16 > sent_sum_low16",
-                          (unsigned int)(test_recv_sum & 0xFFFFu),
-                          (unsigned int)(test_sent_sum & 0xFFFFu));
-            }
-        }
-
-        /* Wait for producer to set test_producer_done = 0 (restart signal) */
-        while (test_producer_done != 0) {
-            scheduler_yield();
-        }
     }
 }
 

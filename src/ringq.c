@@ -62,6 +62,13 @@ void q_init(RingQ *q)
     q->head = 0;
     q->tail = 0;
     q->lock = 0;
+    q->debug_sum = 0UL;
+    q->debug_last_seq = 0u;
+    /* Clear guard array */
+    {
+        unsigned int i;
+        for (i = 0; i < Q_CAP; ++i) q->guard[i] = 0u;
+    }
 }
 #endif
 
@@ -94,12 +101,24 @@ unsigned int q_push(RingQ *q, unsigned int v)
         return 0;     /* full */
     }
     q->buf[q->head] = v;
+    /* Set guard for this slot so we can detect later corruption */
+    q->guard[q->head] = 0xA5A5u;
     q->head = next;
     after_count = q_count(q);
 
     /* Sanity check: count should increase by 1 */
     if (after_count != (unsigned int)((before_count + 1) & (Q_CAP - 1))) {
         ringq_debug_fail("ringq: q_push count mismatch", before_count, after_count);
+    }
+
+    /* Update lightweight invariants: running checksum and last pushed seq.
+     * These help detect silent corruption of buffer contents. */
+    q->debug_sum += (unsigned long)v;
+    q->debug_last_seq = v;
+
+    /* Defensive check: total popped should never exceed total pushed. */
+    if (ringq_total_popped > ringq_total_pushed) {
+        ringq_debug_fail("ringq: popped > pushed", (unsigned int)(ringq_total_popped & 0xFFFFFFFFu), (unsigned int)(ringq_total_pushed & 0xFFFFFFFFu));
     }
 
     /* Instrumentation: increment global pushed counter if present */
@@ -122,6 +141,13 @@ unsigned int q_pop(RingQ *q, unsigned int *out)
     }
     
     *out = q->buf[q->tail];
+    /* Verify guard before consuming */
+    if (q->guard[q->tail] != 0xA5A5u) {
+        ringq_debug_fail("ringq: guard mismatch on pop", q->tail, q->guard[q->tail]);
+    }
+
+    /* clear guard and advance tail */
+    q->guard[q->tail] = 0u;
     q->tail = (unsigned int)((q->tail + 1) & (Q_CAP - 1));
     after_count = q_count(q);
 
@@ -132,6 +158,17 @@ unsigned int q_pop(RingQ *q, unsigned int *out)
 
     /* Instrumentation: increment global popped counter if present */
     ringq_total_popped++;
+
+    /* Update running checksum and validate when queue becomes empty. */
+    q->debug_sum -= (unsigned long)(*out);
+    if (q_count(q) == 0u && q->debug_sum != 0UL) {
+        ringq_debug_fail("ringq: debug_sum non-zero on empty", (unsigned int)(q->debug_sum & 0xFFFFFFFFu), 0u);
+    }
+
+    /* Defensive check: total popped should never exceed total pushed. */
+    if (ringq_total_popped > ringq_total_pushed) {
+        ringq_debug_fail("ringq: popped > pushed", (unsigned int)(ringq_total_popped & 0xFFFFFFFFu), (unsigned int)(ringq_total_pushed & 0xFFFFFFFFu));
+    }
 
     q_unlock(q);
     return 1;
