@@ -41,7 +41,7 @@ typedef struct {
     unsigned long debug_sum;
     unsigned int debug_last_seq;
     /* Per-slot guard pattern to detect overwrites/zeroing of buffer slots. */
-    unsigned short guard[Q_CAP];
+    unsigned int guard[Q_CAP];
 } RingQ;
 
 void q_init(RingQ *q);

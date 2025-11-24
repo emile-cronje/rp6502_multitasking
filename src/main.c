@@ -2,7 +2,7 @@
 #include <stddef.h> /* For NULL */
 #include <stdlib.h> /* For malloc and free */
 
-const unsigned int BATCH_SIZE = 100u;    
+const unsigned int BATCH_SIZE = 250;    
 const unsigned int MAX_ITEM_COUNT = 2000;    
 const unsigned int use_monitor = 1u;    
 void scheduler_sleep(unsigned short ticks);
@@ -374,6 +374,12 @@ static void queue_test_producer(void *arg)
 
         /* Wait for consumer to be ready for the next run */
         test_consumer_ready = 0;
+        test_producer_done = 0;
+        test_sent_count = 0;
+        test_recv_count = 0;
+        test_seq = 0UL;
+        test_sent_sum = 0UL;
+        test_recv_sum = 0UL;
         while (test_consumer_ready == 0) {
             scheduler_yield();
         }
@@ -387,76 +393,20 @@ static void queue_test_producer(void *arg)
             puts(buf);
         }        
 
-        test_sent_count = 0;
-        test_recv_count = 0;
-        test_producer_done = 0;
-        test_seq = 0UL; /* reset per-run sequence counter */
         test_start_ticks = scheduler_get_ticks();
-        test_sent_sum = 0UL;
-        test_recv_sum = 0UL;
 
         i = 0;
-
         while (i < test_total_item_count)
         {
-            unsigned int batch_end = i + BATCH_SIZE;
-
-            if (batch_end > test_total_item_count)
-                batch_end = test_total_item_count;
-
-            /* Send a batch without yielding between each push to reduce context switches */
-            while (i < batch_end)
-            {
-                /* wait until we can push one item (push monotonic sequence for tracing) */
-                {
-                    unsigned int seq = (unsigned int)(++test_seq);
-                    while (!q_push(&test_q_2, seq)) {
-                        /* let consumer run */
-                        scheduler_yield();
-                    }
-
-                    test_sent_count = i + 1;
-                    test_sent_sum += (unsigned long)seq;
-                    i++;
-                }
-
-                // if (test_sent_count % 500 == 0u)
-                // {
-                //     itoa_new(test_run_count, buf, sizeof(buf));
-                //     puts("\r\n");                    
-                //     puts("Test run:");
-                //     puts(buf);
-
-                //     itoa_new(test_total_item_count, buf, sizeof(buf));
-                //     puts("Total item count:");
-                //     puts(buf);
-
-                //     itoa_new(test_recv_count, buf, sizeof(buf));
-                //     puts("Received count:");
-                //     puts(buf);
-
-                //     short_pct = (unsigned int)(((unsigned long)test_recv_count * 100UL) / (unsigned long)test_total_item_count);                    
-                //     itoa_new(short_pct, buf, sizeof(buf));
-                //     puts("Completed %:");
-                //     puts(buf);
-                // }                
+            unsigned int seq = (unsigned int)(++test_seq);
+            while (!q_push(&test_q_2, seq)) {
+                /* let consumer run */
+                scheduler_yield();
             }
 
-            /* After sending a batch, yield a few times to let consumer drain */
-            for (y = 0; y < 10u; ++y)
-                scheduler_yield();
-
-            /* If queue is still large, wait until it drains below low watermark */
-            while (q_count(&test_q_2) > Q_LOW_WATERMARK)
-                scheduler_yield();
-
-            // itoa_new(i, buf, sizeof(buf));
-            // puts("After batch item index:");
-            // puts(buf);
-
-            // itoa_new(test_recv_count, buf, sizeof(buf));
-            // puts("After batch received count:");
-            // puts(buf);            
+            test_sent_count = i + 1;
+            test_sent_sum += (unsigned long)seq;
+            i++;
         }
 
         /* Signal consumer that producer has finished enqueuing for this run,
@@ -586,7 +536,7 @@ static void queue_test_consumer(void *arg)
             }
             /* Check if done: producer finished AND queue is empty */
             if (test_producer_done && q_is_empty(&test_q_2)) {
-                puts("Consumer: detected producer done and empty queue");
+                //puts("Consumer: detected producer done and empty queue");
                 break;
             }
             scheduler_yield();
@@ -662,7 +612,7 @@ static void idle_task(void *arg)
 void task_monitor(void *arg)
 {
     char num_buffer[8];
-    static char summary_buffer[512];
+    static char summary_buffer[1024];
     char bar[32];
     size_t sb_pos = 0;
     unsigned int fill;
@@ -981,16 +931,16 @@ void main()
 
     if (use_monitor == 1)
     {
-//        scheduler_add(task_a, NULL);
-  //      scheduler_add(task_b, NULL);
+        scheduler_add(task_a, NULL);
+        scheduler_add(task_b, NULL);
         scheduler_add(queue_test_producer, NULL);
         scheduler_add(queue_test_consumer, NULL);
 
-        // scheduler_add(producer_task, NULL);
-        // scheduler_add(consumer_task_1, NULL);
+        scheduler_add(producer_task, NULL);
+        scheduler_add(consumer_task_1, NULL);
+        scheduler_add(consumer_task_2, NULL);        
         scheduler_add(task_monitor, NULL);        
-  //      scheduler_add(consumer_task_2, NULL);
-//        scheduler_add(deep_stack_test, NULL);
+        scheduler_add(deep_stack_test, NULL);
     }
     else
     {
