@@ -2,7 +2,7 @@
 #include <stddef.h> /* For NULL */
 #include <stdlib.h> /* For malloc and free */
 
-const unsigned int BATCH_SIZE = 250;    
+const unsigned int BATCH_SIZE = 500;    
 const unsigned int MAX_ITEM_COUNT = 2000;    
 const unsigned int use_monitor = 1u;    
 void scheduler_sleep(unsigned short ticks);
@@ -386,12 +386,12 @@ static void queue_test_producer(void *arg)
 
         test_total_item_count = pseudo_random(100u, MAX_ITEM_COUNT);
 
-        if (use_monitor == 1)
-        {
-            itoa_new(test_total_item_count, buf, sizeof(buf));
-            puts("Test Queue: total items:");
-            puts(buf);
-        }        
+        // if (use_monitor == 1)
+        // {
+        //     itoa_new(test_total_item_count, buf, sizeof(buf));
+        //     puts("Test Queue: total items:");
+        //     puts(buf);
+        // }        
 
         test_start_ticks = scheduler_get_ticks();
 
@@ -935,6 +935,7 @@ void main()
         scheduler_add(task_b, NULL);
         scheduler_add(queue_test_producer, NULL);
         scheduler_add(queue_test_consumer, NULL);
+        scheduler_add(queue_test_consumer, NULL);        
 
         scheduler_add(producer_task, NULL);
         scheduler_add(consumer_task_1, NULL);

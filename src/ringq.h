@@ -21,7 +21,7 @@
 #endif
 
 /* Power-of-two capacity for cheap masking; keep in sync with main if changed. */
-#define Q_CAP 2048u
+#define Q_CAP 2048
 
 typedef struct {
     unsigned int buf[Q_CAP];

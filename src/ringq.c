@@ -47,14 +47,14 @@ static inline void irq_enable(void) { /* no-op */ }
 
 void q_lock(RingQ *q)
 {
-    irq_disable();
-    q->lock = 1;
+    // irq_disable();
+    // q->lock = 1;
 }
 
 void q_unlock(RingQ *q)
 {
-    q->lock = 0;
-    irq_enable();
+    // q->lock = 0;
+    // irq_enable();
 }
 
 void q_init(RingQ *q)
