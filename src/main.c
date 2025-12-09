@@ -1,10 +1,26 @@
 #include "scheduler.h"
 #include <stddef.h> /* For NULL */
 #include <stdlib.h> /* For malloc and free */
+#include <rp6502.h>
+#include <stdbool.h>
+#include <fcntl.h>
 
 const unsigned int BATCH_SIZE = 500;    
 const unsigned int MAX_ITEM_COUNT = 2000;    
-const unsigned int use_monitor = 1u;    
+const unsigned int use_monitor = 1u;
+
+/* TCP UART Configuration */
+#define WIFI_SSID "Cudy24G"
+#define WIFI_PASSWORD "ZAnne19991214"
+#define SERVER_IP "192.168.10.250"
+#define SERVER_PORT "8080"
+#define TCP_TEST_MSG_COUNT 1
+#define TCP_TEST_MSG_LENGTH 1
+#define TCP_BATCH_SIZE 10
+#define RESPONSE_BUFFER_SIZE 256
+#define COMMAND_TIMEOUT 10000
+#define RESPONSE_QUEUE_SIZE 10
+#define SENT_MESSAGE_TRACKING_SIZE 50    
 void scheduler_sleep(unsigned short ticks);
 void scheduler_yield(void);
 
@@ -85,6 +101,43 @@ static const unsigned int CONS_SLEEP_MAX = 1000;
 static const unsigned int Q_HIGH_WATERMARK = (Q_CAP * 3) / 4; /* 75% full */
 static const unsigned int Q_LOW_WATERMARK = (Q_CAP) / 4;      /* 25% full */
 
+/* TCP UART Data Structures */
+typedef struct {
+    int id;
+    char category[16];
+    char base64_message[512];
+    char base64_hash[64];
+    bool valid;
+} ResponseMessage;
+
+typedef struct {
+    ResponseMessage messages[RESPONSE_QUEUE_SIZE];
+    int write_idx;
+    int read_idx;
+    int count;
+} ResponseQueue;
+
+typedef struct {
+    int id;
+    bool sent;
+    bool response_received;
+    char timestamp[32];
+} SentMessageTracker;
+
+typedef struct {
+    SentMessageTracker messages[TCP_TEST_MSG_COUNT];
+    int count;
+} MessageTracker;
+
+/* TCP UART Global State */
+static ResponseQueue g_tcp_response_queue;
+static MessageTracker g_tcp_sent_tracker;
+static int g_tcp_fd = -1;
+static int g_tcp_msgId = 1;
+static volatile bool g_tcp_initialized = false;
+static volatile unsigned int g_tcp_messages_sent = 0;
+static volatile unsigned int g_tcp_responses_received = 0;
+
 /* Approximate total RAM available for the OS (matches rp6502.cfg:
     RAM start = $0200, size = $FD00 - __STACKSIZE__ where __STACKSIZE__ is $0800
     So total bytes = 0xFD00 - 0x0800 = 62464
@@ -145,6 +198,443 @@ char *make_bar(unsigned int pct, char *buf, int width)
 
 /* forward declare fail_halt (defined after test globals so it can print them) */
 static void fail_halt(const char *msg, unsigned int a, unsigned int b);
+
+/* ========== TCP UART Helper Functions ========== */
+
+/* Simple string search function */
+static char* my_strstr(const char *haystack, const char *needle)
+{
+    const char *h, *n;
+    
+    if (!*needle)
+        return (char*)haystack;
+    
+    while (*haystack)
+    {
+        h = haystack;
+        n = needle;
+        
+        while (*h && *n && (*h == *n))
+        {
+            h++;
+            n++;
+        }
+        
+        if (!*n)
+            return (char*)haystack;
+        
+        haystack++;
+    }
+    
+    return NULL;
+}
+
+/* Simple sprintf for specific format strings */
+static void my_sprintf(char *dest, const char *fmt, const char *s1, const char *s2)
+{
+    while (*fmt)
+    {
+        if (*fmt == '%' && *(fmt + 1) == 's')
+        {
+            const char *src = s1;
+            while (*src)
+                *dest++ = *src++;
+            s1 = s2;
+            fmt += 2;
+        }
+        else
+        {
+            *dest++ = *fmt++;
+        }
+    }
+    *dest = '\0';
+}
+
+/* Simple print function */
+static void tcp_print(char *s)
+{
+    while (*s)
+        if (RIA.ready & RIA_READY_TX_BIT)
+            RIA.tx = *s++;
+}
+
+/* Simple delay function */
+static void delay_ms(int ms)
+{
+    int i, j;
+    for (i = 0; i < ms; i++)
+        for (j = 0; j < 100; j++)
+            ;
+}
+
+/* Simple number parser */
+static int parse_number(char *str)
+{
+    int result = 0;
+    while (*str >= '0' && *str <= '9')
+    {
+        result = result * 10 + (*str - '0');
+        str++;
+    }
+    return result;
+}
+
+/* Send string to modem */
+static void send_to_modem(int fd, char *cmd)
+{
+    char *p = cmd;
+    while (*p)
+    {
+        ria_push_char(*p++);
+        ria_set_ax(fd);
+        while (!ria_call_int(RIA_OP_WRITE_XSTACK))
+            ;
+    }
+    ria_push_char('\r');
+    ria_set_ax(fd);
+    while (!ria_call_int(RIA_OP_WRITE_XSTACK))
+        ;
+    ria_push_char('\n');
+    ria_set_ax(fd);
+    while (!ria_call_int(RIA_OP_WRITE_XSTACK))
+        ;
+}
+
+/* Send raw data without line terminators */
+static void send_raw_data(int fd, char *data, int length)
+{
+    int i;
+    for (i = 0; i < length; i++)
+    {
+        ria_push_char(data[i]);
+        ria_set_ax(fd);
+        while (!ria_call_int(RIA_OP_WRITE_XSTACK))
+            ;
+    }
+}
+
+/* Response queue operations */
+static void tcp_queue_init(ResponseQueue *q)
+{
+    q->write_idx = 0;
+    q->read_idx = 0;
+    q->count = 0;
+}
+
+static bool tcp_queue_put(ResponseQueue *q, ResponseMessage *msg)
+{
+    if (q->count >= RESPONSE_QUEUE_SIZE)
+        return false;
+    
+    q->messages[q->write_idx] = *msg;
+    q->write_idx = (q->write_idx + 1) % RESPONSE_QUEUE_SIZE;
+    q->count++;
+    return true;
+}
+
+static bool tcp_queue_get(ResponseQueue *q, ResponseMessage *msg)
+{
+    if (q->count == 0)
+        return false;
+    
+    *msg = q->messages[q->read_idx];
+    q->read_idx = (q->read_idx + 1) % RESPONSE_QUEUE_SIZE;
+    q->count--;
+    return true;
+}
+
+/* Message tracker operations */
+static void tcp_tracker_init(MessageTracker *t)
+{
+    int i;
+    t->count = 0;
+    for (i = 0; i < TCP_TEST_MSG_COUNT; i++)
+    {
+        t->messages[i].id = -1;
+        t->messages[i].sent = false;
+        t->messages[i].response_received = false;
+    }
+}
+
+static void tcp_tracker_mark_sent(MessageTracker *t, int msg_id)
+{
+    if (t->count < TCP_TEST_MSG_COUNT)
+    {
+        t->messages[t->count].id = msg_id;
+        t->messages[t->count].sent = true;
+        t->messages[t->count].response_received = false;
+        t->count++;
+    }
+}
+
+static bool tcp_tracker_mark_response(MessageTracker *t, int msg_id)
+{
+    int i;
+    for (i = 0; i < t->count; i++)
+    {
+        if (t->messages[i].id == msg_id)
+        {
+            t->messages[i].response_received = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static int tcp_tracker_get_missing_count(MessageTracker *t)
+{
+    int i;
+    int missing = 0;
+    for (i = 0; i < t->count; i++)
+    {
+        if (t->messages[i].sent && !t->messages[i].response_received)
+            missing++;
+    }
+    return missing;
+}
+
+/* Parse JSON response */
+static bool parse_json_response(char *json, ResponseMessage *msg)
+{
+    char *p;
+    char *start;
+    int len;
+    
+    msg->valid = false;
+    msg->id = -1;
+    msg->category[0] = '\0';
+    msg->base64_message[0] = '\0';
+    msg->base64_hash[0] = '\0';
+    
+    p = my_strstr(json, "\"Id\":");
+    if (p)
+    {
+        p += 5;
+        while (*p == ' ' || *p == '\t') p++;
+        msg->id = parse_number(p);
+    }
+    
+    p = my_strstr(json, "\"Category\":\"");
+    if (p)
+    {
+        p += 12;
+        len = 0;
+        while (*p && *p != '"' && len < 15)
+        {
+            msg->category[len++] = *p++;
+        }
+        msg->category[len] = '\0';
+    }
+    
+    p = my_strstr(json, "\"Base64Message\":\"");
+    if (p)
+    {
+        p += 17;
+        len = 0;
+        while (*p && *p != '"' && len < 511)
+        {
+            msg->base64_message[len++] = *p++;
+        }
+        msg->base64_message[len] = '\0';
+    }
+    
+    p = my_strstr(json, "\"Base64MessageHash\":\"");
+    if (p)
+    {
+        p += 21;
+        len = 0;
+        while (*p && *p != '"' && len < 63)
+        {
+            msg->base64_hash[len++] = *p++;
+        }
+        msg->base64_hash[len] = '\0';
+    }
+    
+    msg->valid = (msg->id >= 0);
+    return msg->valid;
+}
+
+/* Base64 encoding */
+static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void base64_encode(const char *input, int input_len, char *output)
+{
+    int i;
+    unsigned char a, b, c;
+    int out_idx = 0;
+    
+    for (i = 0; i < input_len; i += 3)
+    {
+        a = input[i];
+        b = (i + 1 < input_len) ? input[i + 1] : 0;
+        c = (i + 2 < input_len) ? input[i + 2] : 0;
+        
+        output[out_idx++] = base64_table[a >> 2];
+        output[out_idx++] = base64_table[((a & 0x03) << 4) | (b >> 4)];
+        output[out_idx++] = (i + 1 < input_len) ? base64_table[((b & 0x0F) << 2) | (c >> 6)] : '=';
+        output[out_idx++] = (i + 2 < input_len) ? base64_table[c & 0x3F] : '=';
+    }
+    
+    output[out_idx] = '\0';
+}
+
+/* Simple hash function (simplified SHA256 substitute) */
+static void sha256_simple(const char *input, int input_len, unsigned char *hash)
+{
+    int i;
+    unsigned long sum = 0x5A5A5A5AL;
+    
+    for (i = 0; i < input_len; i++)
+    {
+        sum = ((sum << 5) + sum) + (unsigned char)input[i];
+        sum ^= (sum >> 16);
+    }
+    
+    for (i = 0; i < 32; i++)
+    {
+        hash[i] = (unsigned char)((sum >> ((i % 4) * 8)) & 0xFF);
+        if (i % 4 == 3)
+            sum = ((sum << 7) ^ (sum >> 11)) + input[i % input_len];
+    }
+}
+
+/* Build test message in JSON format */
+static int build_test_msg(char *msg_text, char *json_output, int max_json_len)
+{
+    static char base64_msg[512];
+    static char base64_hash[64];
+    static unsigned char hash[32];
+    int msg_len;
+    int msgId;
+    char *p;
+    int i;
+    char id_str[12];
+    int id_idx;
+    
+    msg_len = 0;
+    p = msg_text;
+    while (*p)
+    {
+        msg_len++;
+        p++;
+    }
+    
+    sha256_simple(msg_text, msg_len, hash);
+    base64_encode(msg_text, msg_len, base64_msg);
+    base64_encode((char*)hash, 32, base64_hash);
+    
+    msgId = g_tcp_msgId++;
+    
+    id_idx = 0;
+    if (msgId == 0)
+    {
+        id_str[id_idx++] = '0';
+    }
+    else
+    {
+        char digits[12];
+        int d_idx = 0;
+        int temp = msgId;
+        
+        while (temp > 0)
+        {
+            digits[d_idx++] = '0' + (temp % 10);
+            temp /= 10;
+        }
+        while (d_idx > 0)
+            id_str[id_idx++] = digits[--d_idx];
+    }
+    id_str[id_idx] = '\0';
+    
+    p = json_output;
+    *p++ = '{'; *p++ = '"'; *p++ = 'I'; *p++ = 'd'; *p++ = '"'; *p++ = ':';
+    
+    i = 0;
+    while (id_str[i])
+        *p++ = id_str[i++];
+    
+    *p++ = ','; *p++ = '"'; *p++ = 'C'; *p++ = 'a'; *p++ = 't'; *p++ = 'e';
+    *p++ = 'g'; *p++ = 'o'; *p++ = 'r'; *p++ = 'y'; *p++ = '"'; *p++ = ':';
+    *p++ = '"'; *p++ = 'T'; *p++ = 'e'; *p++ = 's'; *p++ = 't'; *p++ = '"';
+    
+    *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's'; *p++ = 'e';
+    *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's'; *p++ = 's';
+    *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = '"'; *p++ = ':'; *p++ = '"';
+    
+    i = 0;
+    while (base64_msg[i] && (p - json_output) < max_json_len - 200)
+        *p++ = base64_msg[i++];
+    
+    *p++ = '"'; *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's';
+    *p++ = 'e'; *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's';
+    *p++ = 's'; *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = 'H'; *p++ = 'a';
+    *p++ = 's'; *p++ = 'h'; *p++ = '"'; *p++ = ':'; *p++ = '"';
+    
+    i = 0;
+    while (base64_hash[i])
+        *p++ = base64_hash[i++];
+    
+    *p++ = '"'; *p++ = ','; *p++ = '"'; *p++ = 'R'; *p++ = 's'; *p++ = 'p';
+    *p++ = 'R'; *p++ = 'e'; *p++ = 'c'; *p++ = 'e'; *p++ = 'i'; *p++ = 'v';
+    *p++ = 'e'; *p++ = 'd'; *p++ = 'O'; *p++ = 'K'; *p++ = '"'; *p++ = ':';
+    *p++ = 'f'; *p++ = 'a'; *p++ = 'l'; *p++ = 's'; *p++ = 'e'; *p++ = '}';
+    
+    *p = '\0';
+    
+    return msgId;
+}
+
+/* Build formatted test message */
+static void build_formatted_msg(int i, int testMsgLength, char *output, int max_len)
+{
+    static const char template[] = "Hello World !!! ";
+    int repeat;
+    char *p;
+    char num_str[12];
+    int n_idx;
+    int temp;
+    
+    p = output;
+    
+    for (repeat = 0; repeat < testMsgLength && (p - output) < max_len - 30; repeat++)
+    {
+        const char *t = template;
+        while (*t)
+            *p++ = *t++;
+        
+        n_idx = 0;
+        temp = i;
+        if (temp == 0)
+        {
+            num_str[n_idx++] = '0';
+        }
+        else
+        {
+            char digits[12];
+            int d_idx = 0;
+            
+            while (temp > 0)
+            {
+                digits[d_idx++] = '0' + (temp % 10);
+                temp /= 10;
+            }
+            while (d_idx > 0)
+                num_str[n_idx++] = digits[--d_idx];
+        }
+        num_str[n_idx] = '\0';
+        
+        n_idx = 0;
+        while (num_str[n_idx])
+            *p++ = num_str[n_idx++];
+        
+        *p++ = '\r';
+        *p++ = '\n';
+    }
+    
+    *p = '\0';
+}
+
+/* ========== End TCP UART Helper Functions ========== */
 
 static void task_a(void *arg)
 {
@@ -905,6 +1395,833 @@ void task_monitor(void *arg)
 
 /* old monitor kept for reference removed to avoid duplicate code and warnings */
 
+/* ========== TCP UART Tasks ========== */
+
+/* TCP Initialization Task - sets up WiFi and TCP connection */
+static void tcp_init_task(void *arg)
+{
+    static char cmd[128];
+    static char response[256];
+    int idx;
+    char ch;
+    int timeout;
+    bool got_ok;
+    
+    (void)arg;
+    
+    tcp_print("TCP Init: Opening modem...\r\n");
+    
+    g_tcp_fd = open("AT:", 0);
+    if (g_tcp_fd < 0)
+    {
+        tcp_print("TCP Init: Modem not found!\r\n");
+        for (;;) {
+            scheduler_sleep(1000);
+            scheduler_yield();
+        }
+    }
+    
+    tcp_print("TCP Init: Modem online\r\n");
+    
+    /* Initialize queues and tracker */
+    tcp_queue_init(&g_tcp_response_queue);
+    tcp_tracker_init(&g_tcp_sent_tracker);
+    
+    /* Send AT test */
+    tcp_print("TCP Init: Testing modem...\r\n");
+    send_to_modem(g_tcp_fd, "AT");
+    delay_ms(1000);
+    
+    /* Disable echo */
+    tcp_print("TCP Init: Disabling echo...\r\n");
+    send_to_modem(g_tcp_fd, "ATE0");
+    delay_ms(1000);
+    
+    /* Connect to WiFi */
+    tcp_print("TCP Init: Connecting to WiFi...\r\n");
+    my_sprintf(cmd, "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASSWORD);
+    send_to_modem(g_tcp_fd, cmd);
+    delay_ms(15000); /* Wait for connection */
+    
+    /* Flush response */
+    idx = 0;
+    timeout = 0;
+    while (timeout < 2000)
+    {
+        ria_push_char(1);
+        ria_set_ax(g_tcp_fd);
+        if (ria_call_int(RIA_OP_READ_XSTACK))
+        {
+            ch = ria_pop_char();
+            if (idx < 255)
+                response[idx++] = ch;
+            timeout = 0;
+        }
+        else
+        {
+            delay_ms(10);
+            timeout += 10;
+        }
+    }
+    response[idx] = '\0';
+    
+    /* Get IP address */
+    tcp_print("TCP Init: Getting IP...\r\n");
+    send_to_modem(g_tcp_fd, "AT+CIFSR");
+    delay_ms(2000);
+    
+    /* Set single connection mode */
+    tcp_print("TCP Init: Setting connection mode...\r\n");
+    send_to_modem(g_tcp_fd, "AT+CIPMUX=0");
+    delay_ms(1000);
+    
+    /* Set active receive mode */
+    send_to_modem(g_tcp_fd, "AT+CIPRECVMODE=0");
+    delay_ms(1000);
+    
+    /* Start TCP connection */
+    tcp_print("TCP Init: Connecting to server...\r\n");
+    my_sprintf(cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s", SERVER_IP, SERVER_PORT);
+    send_to_modem(g_tcp_fd, cmd);
+    delay_ms(3000);
+    
+    /* Flush any pending data */
+    idx = 0;
+    timeout = 0;
+    while (timeout < 1000 && idx < 1000)
+    {
+        ria_push_char(1);
+        ria_set_ax(g_tcp_fd);
+        if (ria_call_int(RIA_OP_READ_XSTACK))
+        {
+            ch = ria_pop_char();
+            timeout = 0;
+            idx++;
+        }
+        else
+        {
+            delay_ms(10);
+            timeout += 10;
+        }
+    }
+    
+    tcp_print("TCP Init: Connection established!\r\n");
+    
+    /* Signal that initialization is complete */
+    g_tcp_initialized = true;
+    
+    /* Keep task alive */
+    for (;;)
+    {
+        scheduler_sleep(1000);
+        scheduler_yield();
+    }
+}
+
+/* TCP Sender Task - sends messages to server */
+static void tcp_sender_task(void *arg)
+{
+    static char test_message[512];
+    static char json_message[1024];
+    static char cmd[128];
+    int i;
+    int msgId;
+    char *p;
+    int msg_len;
+    int total_len;
+    int idx;
+    int temp;
+    
+    (void)arg;
+    
+    /* Wait for TCP initialization */
+    while (!g_tcp_initialized || g_tcp_fd < 0)
+    {
+        scheduler_sleep(500);
+        scheduler_yield();
+    }
+    
+    tcp_print("TCP Sender: Starting message transmission\r\n");
+    
+    for (i = 1; i <= TCP_TEST_MSG_COUNT; i++)
+    {
+        tcp_print("\r\n=== Loop iteration, i=");
+        {
+            char loop_str[12];
+            int loop_idx = 0;
+            int loop_temp = i;
+            if (loop_temp == 0)
+                loop_str[loop_idx++] = '0';
+            else if (loop_temp < 0)
+            {
+                loop_str[loop_idx++] = '-';
+                loop_temp = -loop_temp;
+            }
+            if (loop_temp > 0)
+            {
+                char digits[12];
+                int d_idx = 0;
+                while (loop_temp > 0)
+                {
+                    digits[d_idx++] = '0' + (loop_temp % 10);
+                    loop_temp /= 10;
+                }
+                while (d_idx > 0)
+                    loop_str[loop_idx++] = digits[--d_idx];
+            }
+            loop_str[loop_idx] = '\0';
+            tcp_print(loop_str);
+        }
+        tcp_print(", COUNT=");
+        {
+            char count_str[12];
+            int count_idx = 0;
+            int count_temp = TCP_TEST_MSG_COUNT;
+            if (count_temp == 0)
+                count_str[count_idx++] = '0';
+            else
+            {
+                char digits[12];
+                int d_idx = 0;
+                while (count_temp > 0)
+                {
+                    digits[d_idx++] = '0' + (count_temp % 10);
+                    count_temp /= 10;
+                }
+                while (d_idx > 0)
+                    count_str[count_idx++] = digits[--d_idx];
+            }
+            count_str[count_idx] = '\0';
+            tcp_print(count_str);
+        }
+        tcp_print(" ===\r\n");
+        
+        /* Build message */
+        build_formatted_msg(i, TCP_TEST_MSG_LENGTH, test_message, 512);
+        msgId = build_test_msg(test_message, json_message, 1024);
+        
+        /* Calculate message length */
+        msg_len = 0;
+        p = json_message;
+        while (*p++)
+            msg_len++;
+        
+        total_len = msg_len + 2; /* Include \r\n */
+        
+        /* Build AT+CIPSEND command */
+        cmd[0] = 'A'; cmd[1] = 'T'; cmd[2] = '+';
+        cmd[3] = 'C'; cmd[4] = 'I'; cmd[5] = 'P';
+        cmd[6] = 'S'; cmd[7] = 'E'; cmd[8] = 'N';
+        cmd[9] = 'D'; cmd[10] = '=';
+        
+        idx = 11;
+        temp = total_len;
+        if (temp == 0)
+        {
+            cmd[idx++] = '0';
+        }
+        else
+        {
+            char digits[16];
+            int d_idx = 0;
+            while (temp > 0)
+            {
+                digits[d_idx++] = '0' + (temp % 10);
+                temp /= 10;
+            }
+            while (d_idx > 0)
+                cmd[idx++] = digits[--d_idx];
+        }
+        cmd[idx] = '\0';
+        
+        tcp_print("Sender: Msg ");
+        {
+            char id_str[12];
+            int id_idx = 0;
+            temp = i;
+            if (temp == 0)
+                id_str[id_idx++] = '0';
+            else
+            {
+                char digits[12];
+                int d_idx = 0;
+                while (temp > 0)
+                {
+                    digits[d_idx++] = '0' + (temp % 10);
+                    temp /= 10;
+                }
+                while (d_idx > 0)
+                    id_str[id_idx++] = digits[--d_idx];
+            }
+            id_str[id_idx] = '\0';
+            tcp_print(id_str);
+        }
+        tcp_print(" - ");
+        
+        /* Send AT+CIPSEND */
+        tcp_print("[Sending CIPSEND cmd]\r\n");
+        send_to_modem(g_tcp_fd, cmd);
+        
+        /* Small delay for modem to process */
+        scheduler_sleep(100);
+        scheduler_yield();
+        
+        tcp_print("[Waiting for >]\r\n");
+        
+        /* Wait for > prompt */
+        {
+            char ch;
+            int attempts = 0;
+            bool got_prompt = false;
+            
+            /* Wait up to 3 seconds (300 attempts × 10ms) */
+            while (attempts < 300 && !got_prompt)
+            {
+                ria_push_char(1);
+                ria_set_ax(g_tcp_fd);
+
+                if (ria_call_int(RIA_OP_READ_XSTACK))
+                {
+                    ch = ria_pop_char();
+                    
+                    /* Echo what we got while waiting */
+                    if (RIA.ready & RIA_READY_TX_BIT)
+                        RIA.tx = ch;
+                    
+                    /* Only look for >, ignore everything else */
+                    if (ch == '>')
+                    {
+                        got_prompt = true;
+                        tcp_print("\r\n[Got >]\r\n");
+                        break;
+                    }
+                }
+                else
+                {
+                    scheduler_sleep(10);
+                    scheduler_yield();
+                    attempts++;
+                }
+            }
+            
+            tcp_print("[After wait loop - got_prompt=");
+            if (got_prompt)
+                tcp_print("YES]\r\n");
+            else
+                tcp_print("NO]\r\n");
+            
+            if (!got_prompt)
+            {
+                tcp_print("ERROR: TIMEOUT waiting for > - skipping this message\r\n");
+                continue;
+            }
+        }
+        
+        tcp_print("[About to send data]\r\n");
+        
+        scheduler_sleep(10);
+        scheduler_yield();
+        
+        /* Send message data */
+        send_raw_data(g_tcp_fd, json_message, msg_len);
+        
+        /* Send \r\n terminator */
+        ria_push_char('\r');
+        ria_set_ax(g_tcp_fd);
+        while (!ria_call_int(RIA_OP_WRITE_XSTACK))
+            ;
+        ria_push_char('\n');
+        ria_set_ax(g_tcp_fd);
+        while (!ria_call_int(RIA_OP_WRITE_XSTACK))
+            ;
+        
+        tcp_print("[Data sent, waiting for SEND OK]\r\n");
+        
+        /* Wait for SEND OK confirmation */
+        {
+            char ch;
+            int attempts = 0;
+            bool got_send_ok = false;
+            static char ok_buffer[32];
+            int ok_idx = 0;
+            
+            ok_buffer[0] = '\0';
+            
+            /* Wait up to 5 seconds for SEND OK */
+            while (attempts < 500 && !got_send_ok)
+            {
+                ria_push_char(1);
+                ria_set_ax(g_tcp_fd);
+                
+                if (ria_call_int(RIA_OP_READ_XSTACK))
+                {
+                    ch = ria_pop_char();
+                    
+                    /* Echo */
+                    if (RIA.ready & RIA_READY_TX_BIT)
+                        RIA.tx = ch;
+                    
+                    /* Add to buffer */
+                    if (ok_idx < 31)
+                    {
+                        ok_buffer[ok_idx++] = ch;
+                        ok_buffer[ok_idx] = '\0';
+                    }
+                    
+                    /* Check for "OK" */
+                    if (my_strstr(ok_buffer, "OK"))
+                    {
+                        got_send_ok = true;
+                        tcp_print("\r\n[Got SEND OK]\r\n");
+                        break;
+                    }
+                    
+                    /* Keep buffer small */
+                    if (ok_idx > 20)
+                    {
+                        int i;
+                        for (i = 0; i < 10; i++)
+                            ok_buffer[i] = ok_buffer[ok_idx - 10 + i];
+                        ok_idx = 10;
+                        ok_buffer[ok_idx] = '\0';
+                    }
+                }
+                else
+                {
+                    scheduler_sleep(10);
+                    scheduler_yield();
+                    attempts++;
+                }
+            }
+            
+            if (!got_send_ok)
+            {
+                tcp_print("[WARNING: No SEND OK confirmation]\r\n");
+            }
+        }
+        
+        /* Track as sent */
+        tcp_tracker_mark_sent(&g_tcp_sent_tracker, msgId);
+        g_tcp_messages_sent++;
+        
+        tcp_print("SENT\r\n");
+        
+        /* Give receiver task time to process incoming response
+           Server typically responds within 100-500ms */
+        scheduler_sleep(3000);
+        scheduler_yield();
+    }
+    
+    tcp_print("TCP Sender: All messages sent\r\n");
+    
+    /* Keep task alive */
+    for (;;)
+    {
+        scheduler_sleep(1000);
+        scheduler_yield();
+    }
+}
+
+/* TCP Receiver Task - receives responses from server */
+static void tcp_receiver_task(void *arg)
+{
+    static char read_buffer[1024];
+    static int buf_pos = 0;
+    static ResponseMessage msg;
+    static int payload_remaining = 0;
+    static int idle_count = 0;
+    char ch;
+    char *json_start;
+    char *ipd_start;
+    char *colon;
+    int i;
+    int len;
+    
+    (void)arg;
+    
+    /* Wait for TCP initialization */
+    while (!g_tcp_initialized || g_tcp_fd < 0)
+    {
+        scheduler_sleep(500);
+        scheduler_yield();
+    }
+    
+    tcp_print("TCP Receiver: Starting\r\n");
+    
+    buf_pos = 0;
+    read_buffer[0] = '\0';
+    payload_remaining = 0;
+    idle_count = 0;
+    
+    for (;;)
+    {
+        /* Heartbeat every 100 idle reads to show receiver is active */
+        if (idle_count > 0 && idle_count % 100 == 0)
+        {
+            tcp_print("[R");
+            {
+                char idle_str[12];
+                int idle_idx = 0;
+                int idle_temp = idle_count;
+                if (idle_temp == 0)
+                    idle_str[idle_idx++] = '0';
+                else
+                {
+                    char digits[12];
+                    int d_idx = 0;
+                    while (idle_temp > 0)
+                    {
+                        digits[d_idx++] = '0' + (idle_temp % 10);
+                        idle_temp /= 10;
+                    }
+                    while (d_idx > 0)
+                        idle_str[idle_idx++] = digits[--d_idx];
+                }
+                idle_str[idle_idx] = '\0';
+                tcp_print(idle_str);
+            }
+            tcp_print("]");
+        }
+        
+        /* Try to read available characters */
+        ria_push_char(1);
+        ria_set_ax(g_tcp_fd);
+        if (ria_call_int(RIA_OP_READ_XSTACK))
+        {
+            ch = ria_pop_char();
+            
+            /* Echo character for debugging */
+            if (RIA.ready & RIA_READY_TX_BIT)
+                RIA.tx = ch;
+            
+            idle_count = 0;
+            
+            /* If we're collecting payload bytes after +IPD header */
+            if (payload_remaining > 0)
+            {
+                if (buf_pos < 1023)
+                {
+                    read_buffer[buf_pos++] = ch;
+                    read_buffer[buf_pos] = '\0';
+                }
+                payload_remaining--;
+                
+                if (payload_remaining == 0)
+                {
+                    tcp_print("\r\n[Receiver: Payload complete]\r\n");
+                }
+            }
+            else
+            {
+                /* Add to buffer (header or general data) */
+                if (buf_pos < 1023)
+                {
+                    read_buffer[buf_pos++] = ch;
+                    read_buffer[buf_pos] = '\0';
+                }
+                
+                /* Detect +IPD header for incoming data
+                   Format: "+IPD,<len>:<data>" */
+                if (buf_pos >= 10)
+                {
+                    ipd_start = my_strstr(read_buffer, "+IPD,");
+                    if (ipd_start)
+                    {
+                        /* Find the colon that separates length from data */
+                        colon = ipd_start + 5;  /* skip "+IPD," */
+                        while (*colon && *colon != ':')
+                            colon++;
+                        
+                        /* Only parse if we found the colon */
+                        if (*colon == ':')
+                        {
+                            len = parse_number(ipd_start + 5);
+                            if (len > 0)
+                            {
+                                tcp_print("\r\n[Receiver: Detected +IPD with ");
+                                {
+                                    char len_str[12];
+                                    int len_idx = 0;
+                                    int temp = len;
+                                    if (temp == 0)
+                                        len_str[len_idx++] = '0';
+                                    else
+                                    {
+                                        char digits[12];
+                                        int d_idx = 0;
+                                        while (temp > 0)
+                                        {
+                                            digits[d_idx++] = '0' + (temp % 10);
+                                            temp /= 10;
+                                        }
+                                        while (d_idx > 0)
+                                            len_str[len_idx++] = digits[--d_idx];
+                                    }
+                                    len_str[len_idx] = '\0';
+                                    tcp_print(len_str);
+                                }
+                                tcp_print(" bytes]\\r\\n");
+                                
+                                /* Reset buffer to store only payload (starts after ':') */
+                                buf_pos = 0;
+                                read_buffer[0] = '\0';
+                                payload_remaining = len;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            /* Look for complete JSON objects */
+            if (ch == '}')
+            {
+                /* Search backwards for opening brace */
+                json_start = NULL;
+                for (i = buf_pos - 1; i >= 0; i--)
+                {
+                    if (read_buffer[i] == '{')
+                    {
+                        json_start = &read_buffer[i];
+                        break;
+                    }
+                }
+                
+                if (json_start)
+                {
+                    /* Try to parse JSON */
+                    tcp_print("\r\n[Receiver: Found JSON, attempting parse]\r\n");
+                    if (parse_json_response(json_start, &msg))
+                    {
+                        tcp_print("Receiver: Parsed ID ");
+                        {
+                            char id_str[12];
+                            int id_idx = 0;
+                            int temp = msg.id;
+                            
+                            if (temp == 0)
+                                id_str[id_idx++] = '0';
+                            else
+                            {
+                                char digits[12];
+                                int d_idx = 0;
+                                while (temp > 0)
+                                {
+                                    digits[d_idx++] = '0' + (temp % 10);
+                                    temp /= 10;
+                                }
+                                while (d_idx > 0)
+                                    id_str[id_idx++] = digits[--d_idx];
+                            }
+                            id_str[id_idx] = '\0';
+                            tcp_print(id_str);
+                        }
+                        tcp_print("\r\n");
+                        
+                        /* Add to queue */
+                        if (!tcp_queue_put(&g_tcp_response_queue, &msg))
+                        {
+                            tcp_print("Receiver: Queue full!\r\n");
+                        }
+                        else
+                        {
+                            g_tcp_responses_received++;
+                        }
+                    }
+                    
+                    /* Remove processed JSON from buffer */
+                    {
+                        int json_len = (buf_pos - (json_start - read_buffer));
+                        int remaining = buf_pos - (json_start - read_buffer) - json_len;
+                        if (remaining > 0)
+                        {
+                            for (i = 0; i < remaining; i++)
+                                read_buffer[i] = read_buffer[(json_start - read_buffer) + json_len + i];
+                        }
+                        buf_pos = remaining;
+                        read_buffer[buf_pos] = '\0';
+                    }
+                }
+            }
+            
+            /* Prevent buffer overflow */
+            if (buf_pos > 800)
+            {
+                int keep = 512;
+                for (i = 0; i < keep; i++)
+                    read_buffer[i] = read_buffer[buf_pos - keep + i];
+                buf_pos = keep;
+                read_buffer[buf_pos] = '\0';
+            }
+        }
+        else
+        {
+            /* No data available */
+            idle_count++;
+            
+            /* If we're waiting for payload and it's taking too long, reset */
+            if (payload_remaining > 0 && idle_count > 500)
+            {
+                tcp_print("\r\n[Receiver: Timeout waiting for payload, resetting]\r\n");
+                payload_remaining = 0;
+                buf_pos = 0;
+                read_buffer[0] = '\0';
+                idle_count = 0;
+            }
+            
+            /* Sleep briefly then yield to other tasks */
+            scheduler_sleep(10);
+            scheduler_yield();
+        }
+    }
+}
+
+/* TCP Comparator Task - validates received responses */
+static void tcp_comparator_task(void *arg)
+{
+    ResponseMessage response;
+    int missing;
+    
+    (void)arg;
+    
+    /* Wait for TCP initialization */
+    while (!g_tcp_initialized || g_tcp_fd < 0)
+    {
+        scheduler_sleep(500);
+        scheduler_yield();
+    }
+    
+    tcp_print("TCP Comparator: Starting\r\n");
+    
+    for (;;)
+    {
+        /* Check if there are responses to process */
+        while (tcp_queue_get(&g_tcp_response_queue, &response))
+        {
+            tcp_print("Comparator: Validating ID ");
+            {
+                char id_str[12];
+                int id_idx = 0;
+                int temp = response.id;
+                
+                if (temp == 0)
+                    id_str[id_idx++] = '0';
+                else
+                {
+                    char digits[12];
+                    int d_idx = 0;
+                    while (temp > 0)
+                    {
+                        digits[d_idx++] = '0' + (temp % 10);
+                        temp /= 10;
+                    }
+                    while (d_idx > 0)
+                        id_str[id_idx++] = digits[--d_idx];
+                }
+                id_str[id_idx] = '\0';
+                tcp_print(id_str);
+            }
+            
+            /* Check if this message was actually sent */
+            if (tcp_tracker_mark_response(&g_tcp_sent_tracker, response.id))
+            {
+                tcp_print(" - VALID\r\n");
+            }
+            else
+            {
+                tcp_print(" - ERROR: Not in sent list!\r\n");
+            }
+        }
+        
+        /* Periodically report status */
+        scheduler_sleep(5000);
+        
+        missing = tcp_tracker_get_missing_count(&g_tcp_sent_tracker);
+        
+        tcp_print("TCP Status: Sent=");
+        {
+            char buf[12];
+            int idx = 0;
+            int temp = g_tcp_messages_sent;
+            
+            if (temp == 0)
+                buf[idx++] = '0';
+            else
+            {
+                char digits[12];
+                int d_idx = 0;
+                while (temp > 0)
+                {
+                    digits[d_idx++] = '0' + (temp % 10);
+                    temp /= 10;
+                }
+                while (d_idx > 0)
+                    buf[idx++] = digits[--d_idx];
+            }
+            buf[idx] = '\0';
+            tcp_print(buf);
+        }
+        
+        tcp_print(" Recv=");
+        {
+            char buf[12];
+            int idx = 0;
+            int temp = g_tcp_responses_received;
+            
+            if (temp == 0)
+                buf[idx++] = '0';
+            else
+            {
+                char digits[12];
+                int d_idx = 0;
+                while (temp > 0)
+                {
+                    digits[d_idx++] = '0' + (temp % 10);
+                    temp /= 10;
+                }
+                while (d_idx > 0)
+                    buf[idx++] = digits[--d_idx];
+            }
+            buf[idx] = '\0';
+            tcp_print(buf);
+        }
+        
+        tcp_print(" Missing=");
+        {
+            char buf[12];
+            int idx = 0;
+            int temp = missing;
+            
+            if (temp == 0)
+                buf[idx++] = '0';
+            else
+            {
+                char digits[12];
+                int d_idx = 0;
+                while (temp > 0)
+                {
+                    digits[d_idx++] = '0' + (temp % 10);
+                    temp /= 10;
+                }
+                while (d_idx > 0)
+                    buf[idx++] = digits[--d_idx];
+            }
+            buf[idx] = '\0';
+            tcp_print(buf);
+        }
+        tcp_print("\r\n");
+        
+        if (missing == 0 && g_tcp_sent_tracker.count > 0 && g_tcp_messages_sent >= TCP_TEST_MSG_COUNT)
+        {
+            tcp_print("*** ALL MESSAGES RECEIVED AND VALIDATED! ***\r\n");
+        }
+        
+        scheduler_yield();
+    }
+}
+
+/* ========== End TCP UART Tasks ========== */
+
 void main()
 {
     unsigned int i;
@@ -929,7 +2246,14 @@ void main()
     q_init(&test_q_1);
     q_init(&test_q_2);
 
-    if (use_monitor == 1)
+    /* Initialize TCP UART tasks */
+    tcp_print("Main: Initializing TCP UART tasks...\r\n");
+    scheduler_add(tcp_init_task, NULL);
+    scheduler_add(tcp_sender_task, NULL);
+    scheduler_add(tcp_receiver_task, NULL);
+  //  scheduler_add(tcp_comparator_task, NULL);
+
+    if (use_monitor == -1)
     {
         scheduler_add(task_a, NULL);
         scheduler_add(task_b, NULL);
@@ -943,12 +2267,12 @@ void main()
         scheduler_add(task_monitor, NULL);        
         scheduler_add(deep_stack_test, NULL);
     }
-    else
-    {
-        scheduler_add(queue_test_producer, NULL);
-        scheduler_add(queue_test_consumer, NULL);
-//        scheduler_add(queue_test_consumer, NULL);        
-    }
+    // else
+    // {
+    //     scheduler_add(queue_test_producer, NULL);
+    //     scheduler_add(queue_test_consumer, NULL);
+    //     scheduler_add(queue_test_consumer, NULL);        
+    // }
 
 //    scheduler_add_once(task_once, NULL);
 //    scheduler_add(mem_fluctuate_task, NULL);
