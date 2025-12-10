@@ -2247,13 +2247,13 @@ void main()
     q_init(&test_q_2);
 
     /* Initialize TCP UART tasks */
-    tcp_print("Main: Initializing TCP UART tasks...\r\n");
-    scheduler_add(tcp_init_task, NULL);
-    scheduler_add(tcp_sender_task, NULL);
-    scheduler_add(tcp_receiver_task, NULL);
+    // tcp_print("Main: Initializing TCP UART tasks...\r\n");
+    // scheduler_add(tcp_init_task, NULL);
+    // scheduler_add(tcp_sender_task, NULL);
+    // scheduler_add(tcp_receiver_task, NULL);
   //  scheduler_add(tcp_comparator_task, NULL);
 
-    if (use_monitor == -1)
+    if (use_monitor == 1)
     {
         scheduler_add(task_a, NULL);
         scheduler_add(task_b, NULL);
