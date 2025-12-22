@@ -14,6 +14,10 @@ const unsigned int use_monitor = 1u;
 #define WIFI_PASSWORD "ZAnne19991214"
 #define SERVER_IP "192.168.10.250"
 #define SERVER_PORT "8080"
+#define MQTT_BROKER_IP "192.168.10.174"
+#define MQTT_BROKER_PORT "1883"
+#define TEST_MSG_LENGTH 1
+#define MAX_TRACKED_MESSAGES 10
 #define TCP_TEST_MSG_COUNT 1
 #define TCP_TEST_MSG_LENGTH 1
 #define TCP_BATCH_SIZE 10
@@ -28,49 +32,9 @@ unsigned int pseudo_random(unsigned int min_val, unsigned int max_val);
 
 /* Move declarations to the top of the file */
 static unsigned char mem_fluctuate_active = 0;
-static unsigned char mem_fluctuate_buffer[1024];
+static unsigned char mem_fluctuate_buffer[64];
 
 /* Task to simulate memory usage fluctuation using malloc */
-static void mem_fluctuate_task(void *arg)
-{
-    unsigned int counter;
-    unsigned char *dynamic_buffer;
-    unsigned int buffer_size;
-
-    counter = 0;
-    dynamic_buffer = NULL;
-    buffer_size = 0;
-
-    (void)arg;
-
-    for (;;) {
-        counter++;
-
-        /* Randomly decide to allocate or free memory every 10 cycles */
-        if (counter % 10 == 0) {
-            if (dynamic_buffer) {
-                /* Free the allocated memory */
-                free(dynamic_buffer);
-                dynamic_buffer = NULL;
-                buffer_size = 0;
-            } else {
-                buffer_size = pseudo_random(256, 1024);
-                dynamic_buffer = (unsigned char *)malloc(buffer_size);
-
-                /* Simulate usage if allocation succeeds */
-                if (dynamic_buffer) {
-                    unsigned int i;
-                    for (i = 0; i < buffer_size; i++) {
-                        dynamic_buffer[i] = (unsigned char)(counter + i);
-                    }
-                }
-            }
-        }
-
-        scheduler_sleep(50);
-        scheduler_yield();
-    }
-}
 #include "scheduler.h"
 #include <stdio.h>
 #include <stdint.h>
@@ -100,6 +64,19 @@ static const unsigned int CONS_SLEEP_MAX = 1000;
 
 static const unsigned int Q_HIGH_WATERMARK = (Q_CAP * 3) / 4; /* 75% full */
 static const unsigned int Q_LOW_WATERMARK = (Q_CAP) / 4;      /* 25% full */
+
+/* Message tracking structure */
+typedef struct {
+    unsigned int guid_high;  /* High 16 bits of GUID */
+    unsigned int guid_low;   /* Low 16 bits of GUID */
+    bool sent;
+    bool received;
+} TrackedMessage;
+
+static TrackedMessage g_message_tracker[MAX_TRACKED_MESSAGES];
+static int g_tracked_count = 0;
+static unsigned long g_guid_counter = 0;
+static int g_msgId = 1;
 
 /* TCP UART Data Structures */
 typedef struct {
@@ -135,6 +112,7 @@ static MessageTracker g_tcp_sent_tracker;
 static int g_tcp_fd = -1;
 static int g_tcp_msgId = 1;
 static volatile bool g_tcp_initialized = false;
+static volatile bool g_tcp_send_in_progress = false;
 static volatile unsigned int g_tcp_messages_sent = 0;
 static volatile unsigned int g_tcp_responses_received = 0;
 
@@ -151,6 +129,21 @@ unsigned int scheduler_memory_usage(void);
 
 /* Simple pseudo-random generator (linear congruential method) */
 static unsigned int random_seed = 42u;
+
+void generate_guid(unsigned int *high, unsigned int *low)
+{
+    /* Simple incrementing GUID for embedded system */
+    g_guid_counter++;
+    *high = (unsigned int)((g_guid_counter >> 16) & 0xFFFF);
+    *low = (unsigned int)(g_guid_counter & 0xFFFF);
+}
+
+void print(char *s)
+{
+    while (*s)
+        if (RIA.ready & RIA_READY_TX_BIT)
+            RIA.tx = *s++;
+}
 
 void seed_random(unsigned int val)
 {
@@ -229,6 +222,16 @@ static char* my_strstr(const char *haystack, const char *needle)
     return NULL;
 }
 
+void xram_strcpy(unsigned int addr, const char* str) {
+    int i;
+    RIA.step0 = 1;  // Enable auto-increment
+    RIA.addr0 = addr;
+    for (i = 0; str[i]; i++) {
+        RIA.rw0 = str[i];
+    }
+    RIA.rw0 = 0;
+}
+
 /* Simple sprintf for specific format strings */
 static void my_sprintf(char *dest, const char *fmt, const char *s1, const char *s2)
 {
@@ -300,6 +303,286 @@ static void send_to_modem(int fd, char *cmd)
         ;
 }
 
+bool read_modem_response(int fd, char *buffer, int max_len, int timeout_ms)
+{
+    int idx = 0;
+    int elapsed = 0;
+    int idle_count = 0;
+    char ch;
+    
+    buffer[0] = '\0';
+    
+    // Wait a bit for response to start
+    delay_ms(100);
+    
+    while (elapsed < timeout_ms && idx < max_len - 1)
+    {
+        ria_push_char(1);
+        ria_set_ax(fd);
+        if (ria_call_int(RIA_OP_READ_XSTACK))
+        {
+            ch = ria_pop_char();
+            buffer[idx++] = ch;
+            buffer[idx] = '\0';
+            idle_count = 0;
+            elapsed = 0;
+        }
+        else
+        {
+            idle_count++;
+            // If we've received data and then no data for a while, we're done
+            if (idx > 0 && idle_count > 50)
+                break;
+            delay_ms(10);
+            elapsed += 10;
+        }
+    }
+    
+    return idx > 0;
+}
+
+bool check_response(char *response, const char *expected[], int num_expected)
+{
+    int i;
+
+    /* Treat any ERROR as failure even if OK also appears */
+    if (my_strstr(response, "ERROR") != NULL)
+        return false;
+
+    for (i = 0; i < num_expected; i++)
+    {
+        if (my_strstr(response, expected[i]) != NULL)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool send_at_command(int fd, char *cmd, const char *expected[], int num_expected)
+{
+    static char response[RESPONSE_BUFFER_SIZE];
+    
+    print("Sending: ");
+    print(cmd);
+    print("\r\n");
+    
+    send_to_modem(fd, cmd);
+    
+    // Wait for response
+    if (read_modem_response(fd, response, RESPONSE_BUFFER_SIZE, COMMAND_TIMEOUT))
+    {
+        print("Response: ");
+        print(response);
+        print("\r\n");
+        
+        /* Special-case bare AT: accept OK even if noise ERROR appears */
+        if ((cmd[0] == 'A' && cmd[1] == 'T' && cmd[2] == '\0') && my_strstr(response, "OK"))
+        {
+            print("OK\r\n");
+            return true;
+        }
+
+        if (check_response(response, expected, num_expected))
+        {
+            print("OK\r\n");
+            return true;
+        }
+        else
+        {
+            print("Unexpected response\r\n");
+            return false;
+        }
+    }
+    else
+    {
+        print("Timeout\r\n");
+        return false;
+    }
+}
+
+bool send_at_command_long(int fd, char *cmd, const char *expected[], int num_expected)
+{
+    static char response[RESPONSE_BUFFER_SIZE];
+    
+    print("Sending: ");
+    print(cmd);
+    print("\r\n");
+    
+    send_to_modem(fd, cmd);
+    
+    // Wait for response with longer timeout (20 seconds for WiFi)
+    if (read_modem_response(fd, response, RESPONSE_BUFFER_SIZE, 20000))
+    {
+        print("Response: ");
+        print(response);
+        print("\r\n");
+        
+        if (check_response(response, expected, num_expected))
+        {
+            print("Connected!\r\n");
+            return true;
+        }
+        else
+        {
+            print("Connection failed\r\n");
+            return false;
+        }
+    }
+    else
+    {
+        print("Connection timeout\r\n");
+        return false;
+    }
+}
+
+bool init_mqtt_wifi(int fd)
+{
+    static char cmd[128];
+    static const char *ok_resp[] = {"OK"};
+    static const char *connect_resp[] = {"OK", "WIFI CONNECTED", "WIFI GOT IP"};
+    static const char *tcp_resp[] = {"CONNECT", "ALREADY CONNECTED"};
+    
+    print("Initializing WiFi...\r\n");
+    
+    // AT - Test command
+    if (!send_at_command(fd, "AT", ok_resp, 1))
+        return false;
+
+    delay_ms(500);
+    
+    // ATE0 - Disable echo
+    if (!send_at_command(fd, "ATE0", ok_resp, 1))
+        return false;
+    delay_ms(1000);  // Wait for echo disable to take effect
+    
+    // AT+CWJAP - Join access point (can take 10-15 seconds)
+    print("Connecting to WiFi (may take 15+ seconds)...\r\n");
+    my_sprintf(cmd, "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASSWORD);
+
+    if (!send_at_command_long(fd, cmd, connect_resp, 3))
+        return false;
+
+    delay_ms(2000);  // Wait after connection
+    
+    // AT+CIPSTART - Start TCP connection
+    my_sprintf(cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s", MQTT_BROKER_IP, MQTT_BROKER_PORT);
+
+    if (!send_at_command(fd, cmd, tcp_resp, 3))
+        return false;
+
+    delay_ms(2000);  // Wait for connection to establish and stabilize
+    
+    // In normal mode, we use AT+CIPSEND for reliable message delivery
+    print("Normal mode active. Ready to send/receive with AT+CIPSEND.\\r\\n");
+    
+    print("WiFi initialized successfully!\r\n");
+    return true;
+}
+
+int mqtt_init(void)
+{
+    char broker[] = MQTT_BROKER_IP;
+    char client_id[] = "rp6502_demo";
+    unsigned int port = 1883;    
+    int i, k;
+    char sub_topic[] = "rp6502_sub";
+    unsigned int sub_len;
+    char pub_topic1[] = "rp6502_pub";
+    int msg_count = 0;
+    int publish_total = 10;
+
+    /* STEP 1: Connect to WiFi */
+    print("[1/6] Connecting to WiFi...\n");
+    g_tcp_fd = open("AT:", 0);    
+
+    print("Waiting for WiFi connection...\n");
+
+    if (!init_mqtt_wifi(g_tcp_fd))
+    {
+        print("WiFi initialization failed.\r\n");
+        return -1;
+    }    
+
+    print("WiFi connected!\n");
+    
+    /* STEP 2: Connect to MQTT Broker */
+    print("[2/6] Connecting to MQTT broker...\n");
+    
+    xram_strcpy(0x0000, broker);
+    xram_strcpy(0x0100, client_id);
+
+    printf("Broker: %s:%d\n", broker, port);
+    printf("Client: %s\n", client_id);
+    
+    // Initiate connection
+    RIA.xstack = port >> 8;      // port high
+    RIA.xstack = port & 0xFF;    // port low
+
+    // Push client_id last (will be popped first with api_pop_uint16)
+    RIA.xstack = 0x0100 >> 8;    // client_id high
+    RIA.xstack = 0x0100 & 0xFF;  // client_id low
+
+    // Put hostname address in A/X
+    RIA.a = 0x0000 & 0xFF;       // low
+    RIA.x = 0x0000 >> 8;    
+
+    RIA.op = 0x30;  // mq_connect
+    
+    if (RIA.a != 0) {
+        printf("ERROR: Connection failed: %d\n", RIA.a);
+        return -1;
+    }
+    
+    /* Wait for connection */
+    print("Waiting for MQTT connection...");
+
+    for (i = 0; i < 50; i++) {
+        for (k = 0; k < 10000; k++);
+        RIA.op = 0x38;  /* mq_connected */
+
+        if (RIA.a == 1) {
+            print(" CONNECTED!\n\n");
+            break;
+        }
+
+        if (i % 5 == 0) print(".");
+    }
+    
+    RIA.op = 0x38;  /* Check connection status */
+
+    if (RIA.a != 1) {
+        print("\nERROR: Connection timeout\n");
+        return -1;
+    }
+
+    /* STEP 3: Subscribe to Topics */
+    print("[3/6] Subscribing to topics...\n");
+    
+    xram_strcpy(0x0200, sub_topic);
+    sub_len = strlen(sub_topic);
+    
+    printf("Subscribing to: %s\n", sub_topic);
+
+    RIA.xstack = 0x0200 >> 8;    
+    RIA.xstack = 0x0200 & 0xFF;    
+    RIA.xstack = sub_len >> 8;    
+    RIA.xstack = sub_len & 0xFF;
+    RIA.xstack = 1;                 // QoS 1    
+    RIA.op = 0x33;  // mq_subscribe
+
+    while (RIA.busy) { }    
+
+    if (RIA.a == 0) {
+        print("Subscribed successfully!\n\n");
+    } else {
+        print("ERROR: Subscribe failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 /* Send raw data without line terminators */
 static void send_raw_data(int fd, char *data, int length)
 {
@@ -332,17 +615,6 @@ static bool tcp_queue_put(ResponseQueue *q, ResponseMessage *msg)
     return true;
 }
 
-static bool tcp_queue_get(ResponseQueue *q, ResponseMessage *msg)
-{
-    if (q->count == 0)
-        return false;
-    
-    *msg = q->messages[q->read_idx];
-    q->read_idx = (q->read_idx + 1) % RESPONSE_QUEUE_SIZE;
-    q->count--;
-    return true;
-}
-
 /* Message tracker operations */
 static void tcp_tracker_init(MessageTracker *t)
 {
@@ -365,32 +637,6 @@ static void tcp_tracker_mark_sent(MessageTracker *t, int msg_id)
         t->messages[t->count].response_received = false;
         t->count++;
     }
-}
-
-static bool tcp_tracker_mark_response(MessageTracker *t, int msg_id)
-{
-    int i;
-    for (i = 0; i < t->count; i++)
-    {
-        if (t->messages[i].id == msg_id)
-        {
-            t->messages[i].response_received = true;
-            return true;
-        }
-    }
-    return false;
-}
-
-static int tcp_tracker_get_missing_count(MessageTracker *t)
-{
-    int i;
-    int missing = 0;
-    for (i = 0; i < t->count; i++)
-    {
-        if (t->messages[i].sent && !t->messages[i].response_received)
-            missing++;
-    }
-    return missing;
 }
 
 /* Parse JSON response */
@@ -498,8 +744,168 @@ static void sha256_simple(const char *input, int input_len, unsigned char *hash)
     }
 }
 
+int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *out_base64_msg, char *out_base64_hash, unsigned int *guid_high, unsigned int *guid_low)
+{
+    static char base64_msg[512];
+    static char base64_hash[64];
+    static unsigned char hash[32];
+    int msg_len;
+    int msgId;
+    char *p;
+    int i;
+    char id_str[12];
+    int id_idx;
+    
+    // Get message length
+    msg_len = 0;
+    p = msg_text;
+    while (*p)
+    {
+        msg_len++;
+        p++;
+    }
+    
+    // Calculate hash
+    sha256_simple(msg_text, msg_len, hash);
+    
+    // Base64 encode message
+    base64_encode(msg_text, msg_len, base64_msg);
+    
+    // Base64 encode hash
+    base64_encode((char*)hash, 32, base64_hash);
+    
+    // Get next message ID
+    msgId = g_msgId++;
+    
+    // Generate GUID
+    generate_guid(guid_high, guid_low);
+    
+    // Convert msgId to string
+    id_idx = 0;
+    if (msgId == 0)
+    {
+        id_str[id_idx++] = '0';
+    }
+    else
+    {
+        char digits[12];
+        int d_idx = 0;
+        int temp = msgId;
+        
+        while (temp > 0)
+        {
+            digits[d_idx++] = '0' + (temp % 10);
+            temp /= 10;
+        }
+        while (d_idx > 0)
+            id_str[id_idx++] = digits[--d_idx];
+    }
+    id_str[id_idx] = '\0';
+    
+    // Build JSON string manually
+    p = json_output;
+    
+    // {"Id":
+    *p++ = '{'; *p++ = '"'; *p++ = 'I'; *p++ = 'd'; *p++ = '"'; *p++ = ':';
+    
+    // <msgId>
+    i = 0;
+    while (id_str[i])
+        *p++ = id_str[i++];
+    
+    // ,"Guid":
+    *p++ = ',';
+    *p++ = '"';
+    *p++ = 'G';
+    *p++ = 'u';
+    *p++ = 'i';
+    *p++ = 'd';
+    *p++ = '"';
+    *p++ = ':';
+    *p++ = '"';
+    
+    // Convert GUID to hex string (8 chars)
+    for (i = 3; i >= 0; i--)
+    {
+        unsigned char nibble;
+        nibble = ((*guid_high) >> (i * 4)) & 0x0F;
+        *p++ = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    }
+    for (i = 3; i >= 0; i--)
+    {
+        unsigned char nibble;
+        nibble = ((*guid_low) >> (i * 4)) & 0x0F;
+        *p++ = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    }
+    
+    *p++ = '"';
+    
+    // ,"Category":"Test"
+    *p++ = ','; *p++ = '"'; *p++ = 'C'; *p++ = 'a'; *p++ = 't'; *p++ = 'e';
+    *p++ = 'g'; *p++ = 'o'; *p++ = 'r'; *p++ = 'y'; *p++ = '"'; *p++ = ':';
+    *p++ = '"'; *p++ = 'T'; *p++ = 'e'; *p++ = 's'; *p++ = 't'; *p++ = '"';
+    
+    // ,"Message":"
+    *p++ = ','; *p++ = '"'; *p++ = 'M'; *p++ = 'e'; *p++ = 's'; *p++ = 's';
+    *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = '"'; *p++ = ':'; *p++ = '"';
+    
+    // <msg_text>
+    i = 0;
+    while (msg_text[i] && (p - json_output) < max_json_len - 300)
+        *p++ = msg_text[i++];
+    
+    // "
+    *p++ = '"';
+    
+    // ,"Base64Message":"
+    *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's'; *p++ = 'e';
+    *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's'; *p++ = 's';
+    *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = '"'; *p++ = ':'; *p++ = '"';
+    
+    // <base64_msg>
+    i = 0;
+    while (base64_msg[i] && (p - json_output) < max_json_len - 200)
+        *p++ = base64_msg[i++];
+    
+    // ","Base64MessageHash":"
+    *p++ = '"'; *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's';
+    *p++ = 'e'; *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's';
+    *p++ = 's'; *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = 'H'; *p++ = 'a';
+    *p++ = 's'; *p++ = 'h'; *p++ = '"'; *p++ = ':'; *p++ = '"';
+    
+    // <base64_hash>
+    i = 0;
+    while (base64_hash[i])
+        *p++ = base64_hash[i++];
+    
+    // ","RspReceivedOK":false}
+    *p++ = '"'; *p++ = ','; *p++ = '"'; *p++ = 'R'; *p++ = 's'; *p++ = 'p';
+    *p++ = 'R'; *p++ = 'e'; *p++ = 'c'; *p++ = 'e'; *p++ = 'i'; *p++ = 'v';
+    *p++ = 'e'; *p++ = 'd'; *p++ = 'O'; *p++ = 'K'; *p++ = '"'; *p++ = ':';
+    *p++ = 'f'; *p++ = 'a'; *p++ = 'l'; *p++ = 's'; *p++ = 'e'; *p++ = '}';
+    
+    *p = '\0';
+    
+    /* Copy base64 values to output buffers if provided */
+    if (out_base64_msg)
+    {
+        for (i = 0; i < 511 && base64_msg[i]; i++)
+            out_base64_msg[i] = base64_msg[i];
+        out_base64_msg[i] = '\0';
+    }
+    
+    if (out_base64_hash)
+    {
+        for (i = 0; i < 63 && base64_hash[i]; i++)
+            out_base64_hash[i] = base64_hash[i];
+        out_base64_hash[i] = '\0';
+    }
+    
+    return msgId;
+}
+
 /* Build test message in JSON format */
-static int build_test_msg(char *msg_text, char *json_output, int max_json_len)
+static int build_test_msg_old(char *msg_text, char *json_output, int max_json_len)
 {
     static char base64_msg[512];
     static char base64_hash[64];
@@ -655,12 +1061,6 @@ static void task_b(void *arg)
         task_b_counter++;        
         scheduler_yield();
     }
-}
-
-static void task_once(void *arg)
-{
-    (void)arg;
-    puts("One-shot task: running once");
 }
 
 /* Deep-stack test task: recursive variant that allocates a small buffer on
@@ -835,8 +1235,6 @@ static void queue_test_producer(void *arg)
     static char buf[32];
     static char summary_buffer[128];    
     size_t sb_pos = 0;
-    unsigned int y;    
-    unsigned int short_pct;
     (void)arg;
 
     for (;;) {
@@ -993,7 +1391,6 @@ static void queue_test_producer(void *arg)
 static void queue_test_consumer(void *arg)
 {
     unsigned int v;
-    static char buf[32];
     (void)arg;
 
     for (;;) {
@@ -1070,14 +1467,6 @@ static void consumer_task_2(void *arg)
 }
 
 /* Idle task used to represent CPU idle time for accounting. */
-static void idle_task(void *arg)
-{
-    (void)arg;
-    for (;;) {
-        scheduler_yield();
-    }
-}
-
 // static void consumer_task_1_old(void *arg)
 // {
 //     unsigned int v;
@@ -1112,19 +1501,7 @@ void task_monitor(void *arg)
     unsigned long cpu_active;
     unsigned long cpu_total;
     char cpu_buf[16];
-    int ti;
-    unsigned int used;
-    unsigned int used_arr[SCHED_MAX_TASKS];
-    unsigned int total_stack = 0;
-    char tnum[4];
-    unsigned long active_pool = 0UL;
-    unsigned int active_count = 0u;
-    unsigned long pct_tenths = 0UL;
-    unsigned int int_part = 0u;
-    unsigned int dec = 0u;
     char pctbuf[8];
-    char decch[2];
-    unsigned int bar_pct = 0u;
     static unsigned int toggle_counter = 0;    
     (void)arg;
 
@@ -1238,14 +1615,11 @@ void task_monitor(void *arg)
             unsigned int used;
             unsigned int used_arr[SCHED_MAX_TASKS];
             unsigned int total_stack = 0;
-            char tnum[4];
             unsigned long active_pool = 0UL;
             unsigned int active_count = 0u;
             unsigned long pct_tenths = 0UL;
             unsigned int int_part = 0u;
             unsigned int dec = 0u;
-            char pctbuf[8];
-            char decch[2];
             unsigned int bar_pct = 0u;
 
             /* Gather per-task used values and compute total_stack */
@@ -1395,829 +1769,332 @@ void task_monitor(void *arg)
 
 /* old monitor kept for reference removed to avoid duplicate code and warnings */
 
-/* ========== TCP UART Tasks ========== */
 
-/* TCP Initialization Task - sets up WiFi and TCP connection */
-static void tcp_init_task(void *arg)
+int track_message(unsigned int guid_high, unsigned int guid_low)
 {
-    static char cmd[128];
-    static char response[256];
-    int idx;
-    char ch;
-    int timeout;
-    bool got_ok;
+    if (g_tracked_count >= MAX_TRACKED_MESSAGES)
+        return -1;
     
-    (void)arg;
+    g_message_tracker[g_tracked_count].guid_high = guid_high;
+    g_message_tracker[g_tracked_count].guid_low = guid_low;
+    g_message_tracker[g_tracked_count].sent = true;
+    g_message_tracker[g_tracked_count].received = false;
+    g_tracked_count++;
     
-    tcp_print("TCP Init: Opening modem...\r\n");
-    
-    g_tcp_fd = open("AT:", 0);
-    if (g_tcp_fd < 0)
+    return g_tracked_count - 1;
+}
+
+/* Mark message as received */
+bool mark_received(unsigned int guid_high, unsigned int guid_low)
+{
+    int i;
+    for (i = 0; i < g_tracked_count; i++)
     {
-        tcp_print("TCP Init: Modem not found!\r\n");
-        for (;;) {
-            scheduler_sleep(1000);
-            scheduler_yield();
+        if (g_message_tracker[i].guid_high == guid_high &&
+            g_message_tracker[i].guid_low == guid_low)
+        {
+            g_message_tracker[i].received = true;
+            return true;
         }
     }
-    
-    tcp_print("TCP Init: Modem online\r\n");
-    
-    /* Initialize queues and tracker */
-    tcp_queue_init(&g_tcp_response_queue);
-    tcp_tracker_init(&g_tcp_sent_tracker);
-    
-    /* Send AT test */
-    tcp_print("TCP Init: Testing modem...\r\n");
-    send_to_modem(g_tcp_fd, "AT");
-    delay_ms(1000);
-    
-    /* Disable echo */
-    tcp_print("TCP Init: Disabling echo...\r\n");
-    send_to_modem(g_tcp_fd, "ATE0");
-    delay_ms(1000);
-    
-    /* Connect to WiFi */
-    tcp_print("TCP Init: Connecting to WiFi...\r\n");
-    my_sprintf(cmd, "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASSWORD);
-    send_to_modem(g_tcp_fd, cmd);
-    delay_ms(15000); /* Wait for connection */
-    
-    /* Flush response */
-    idx = 0;
-    timeout = 0;
-    while (timeout < 2000)
+    return false;
+}
+
+/* Check if all messages received */
+bool all_messages_received(void)
+{
+    int i;
+    for (i = 0; i < g_tracked_count; i++)
     {
-        ria_push_char(1);
-        ria_set_ax(g_tcp_fd);
-        if (ria_call_int(RIA_OP_READ_XSTACK))
+        if (g_message_tracker[i].sent && !g_message_tracker[i].received)
+            return false;
+    }
+    return true;
+}
+
+/* Count received messages */
+int count_received_messages(void)
+{
+    int i;
+    int count = 0;
+    for (i = 0; i < g_tracked_count; i++)
+    {
+        if (g_message_tracker[i].received)
+            count++;
+    }
+    return count;
+}
+
+static void mqtt_producer_task(void *arg)
+{
+    int publish_total;    
+    int i, j;
+    volatile long k;
+    unsigned int msg_len, topic_len, bytes_read;
+    static char test_message[512];    
+    static char json_message[1024];    
+    static char sent_base64_msg[512];
+    static char sent_base64_hash[64];
+    char pub_topic1[] = "rp6502_pub";    
+
+    print("[4/6] Publishing messages...\n");
+
+    publish_total = 10;
+
+    for (i = 0; i < publish_total; i++) {
+        unsigned int msg_guid_high, msg_guid_low;
+        
+        build_formatted_msg(i + 1, TEST_MSG_LENGTH, test_message, 512);    
+        build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash, &msg_guid_high, &msg_guid_low);
+        
+        /* Track this message */
+        track_message(msg_guid_high, msg_guid_low);
+        printf("\r\nTracking message with GUID: %04X%04X\n", msg_guid_high, msg_guid_low);
+
+        xram_strcpy(0x0300, pub_topic1);
+        xram_strcpy(0x0400, json_message);
+        
+        printf("Publishing (%d/%d): %s -> %s\n", i + 1, publish_total, pub_topic1, json_message);
+        //printf("Topic and message len: %zu -> %zu\n", strlen(pub_topic1), strlen(json_message));    
+        
+        /* payload address */   
+        RIA.xstack = 0x0400 >> 8;
+        RIA.xstack = 0x0400 & 0xFF;
+
+        /* payload length */   
+        RIA.xstack = strlen(json_message) >> 8;    
+        RIA.xstack = strlen(json_message) & 0xFF;
+
+        /* topic address */   
+        RIA.xstack = 0x0300 >> 8;    /* topic addr high */
+        RIA.xstack = 0x0300 & 0xFF;  /* topic addr low */
+
+        /* topic length */
+        RIA.xstack = strlen(pub_topic1) >> 8;    
+        RIA.xstack = strlen(pub_topic1) & 0xFF;
+
+        RIA.xstack = 1;                              /* retain = false */    
+        RIA.xstack = 1;                              /* QoS 1 */    
+
+        // Kick off publish
+        RIA.op = 0x32;  // mq_publish
+
+        while (RIA.busy) { }
+
+        if (RIA.mq_publish_done)
         {
-            ch = ria_pop_char();
-            if (idx < 255)
-                response[idx++] = ch;
-            timeout = 0;
+            print("Message published!\n");
         }
         else
         {
-            delay_ms(10);
-            timeout += 10;
+            print("ERROR: Publish failed\n");
         }
-    }
-    response[idx] = '\0';
-    
-    /* Get IP address */
-    tcp_print("TCP Init: Getting IP...\r\n");
-    send_to_modem(g_tcp_fd, "AT+CIFSR");
-    delay_ms(2000);
-    
-    /* Set single connection mode */
-    tcp_print("TCP Init: Setting connection mode...\r\n");
-    send_to_modem(g_tcp_fd, "AT+CIPMUX=0");
-    delay_ms(1000);
-    
-    /* Set active receive mode */
-    send_to_modem(g_tcp_fd, "AT+CIPRECVMODE=0");
-    delay_ms(1000);
-    
-    /* Start TCP connection */
-    tcp_print("TCP Init: Connecting to server...\r\n");
-    my_sprintf(cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s", SERVER_IP, SERVER_PORT);
-    send_to_modem(g_tcp_fd, cmd);
-    delay_ms(3000);
-    
-    /* Flush any pending data */
-    idx = 0;
-    timeout = 0;
-    while (timeout < 1000 && idx < 1000)
-    {
-        ria_push_char(1);
-        ria_set_ax(g_tcp_fd);
-        if (ria_call_int(RIA_OP_READ_XSTACK))
-        {
-            ch = ria_pop_char();
-            timeout = 0;
-            idx++;
-        }
-        else
-        {
-            delay_ms(10);
-            timeout += 10;
-        }
-    }
-    
-    tcp_print("TCP Init: Connection established!\r\n");
-    
-    /* Signal that initialization is complete */
-    g_tcp_initialized = true;
-    
-    /* Keep task alive */
-    for (;;)
-    {
+
         scheduler_sleep(1000);
         scheduler_yield();
     }
 }
 
-/* TCP Sender Task - sends messages to server */
-static void tcp_sender_task(void *arg)
+static void mqtt_consumer_task(void *arg)
 {
-    static char test_message[512];
-    static char json_message[1024];
-    static char cmd[128];
-    int i;
-    int msgId;
-    char *p;
-    int msg_len;
-    int total_len;
-    int idx;
-    int temp;
-    
-    (void)arg;
-    
-    /* Wait for TCP initialization */
-    while (!g_tcp_initialized || g_tcp_fd < 0)
-    {
-        scheduler_sleep(500);
-        scheduler_yield();
-    }
-    
-    tcp_print("TCP Sender: Starting message transmission\r\n");
-    
-    for (i = 1; i <= TCP_TEST_MSG_COUNT; i++)
-    {
-        tcp_print("\r\n=== Loop iteration, i=");
-        {
-            char loop_str[12];
-            int loop_idx = 0;
-            int loop_temp = i;
-            if (loop_temp == 0)
-                loop_str[loop_idx++] = '0';
-            else if (loop_temp < 0)
-            {
-                loop_str[loop_idx++] = '-';
-                loop_temp = -loop_temp;
-            }
-            if (loop_temp > 0)
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (loop_temp > 0)
-                {
-                    digits[d_idx++] = '0' + (loop_temp % 10);
-                    loop_temp /= 10;
-                }
-                while (d_idx > 0)
-                    loop_str[loop_idx++] = digits[--d_idx];
-            }
-            loop_str[loop_idx] = '\0';
-            tcp_print(loop_str);
-        }
-        tcp_print(", COUNT=");
-        {
-            char count_str[12];
-            int count_idx = 0;
-            int count_temp = TCP_TEST_MSG_COUNT;
-            if (count_temp == 0)
-                count_str[count_idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (count_temp > 0)
-                {
-                    digits[d_idx++] = '0' + (count_temp % 10);
-                    count_temp /= 10;
-                }
-                while (d_idx > 0)
-                    count_str[count_idx++] = digits[--d_idx];
-            }
-            count_str[count_idx] = '\0';
-            tcp_print(count_str);
-        }
-        tcp_print(" ===\r\n");
-        
-        /* Build message */
-        build_formatted_msg(i, TCP_TEST_MSG_LENGTH, test_message, 512);
-        msgId = build_test_msg(test_message, json_message, 1024);
-        
-        /* Calculate message length */
-        msg_len = 0;
-        p = json_message;
-        while (*p++)
-            msg_len++;
-        
-        total_len = msg_len + 2; /* Include \r\n */
-        
-        /* Build AT+CIPSEND command */
-        cmd[0] = 'A'; cmd[1] = 'T'; cmd[2] = '+';
-        cmd[3] = 'C'; cmd[4] = 'I'; cmd[5] = 'P';
-        cmd[6] = 'S'; cmd[7] = 'E'; cmd[8] = 'N';
-        cmd[9] = 'D'; cmd[10] = '=';
-        
-        idx = 11;
-        temp = total_len;
-        if (temp == 0)
-        {
-            cmd[idx++] = '0';
-        }
-        else
-        {
-            char digits[16];
-            int d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                cmd[idx++] = digits[--d_idx];
-        }
-        cmd[idx] = '\0';
-        
-        tcp_print("Sender: Msg ");
-        {
-            char id_str[12];
-            int id_idx = 0;
-            temp = i;
-            if (temp == 0)
-                id_str[id_idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    id_str[id_idx++] = digits[--d_idx];
-            }
-            id_str[id_idx] = '\0';
-            tcp_print(id_str);
-        }
-        tcp_print(" - ");
-        
-        /* Send AT+CIPSEND */
-        tcp_print("[Sending CIPSEND cmd]\r\n");
-        send_to_modem(g_tcp_fd, cmd);
-        
-        /* Small delay for modem to process */
-        scheduler_sleep(100);
-        scheduler_yield();
-        
-        tcp_print("[Waiting for >]\r\n");
-        
-        /* Wait for > prompt */
-        {
-            char ch;
-            int attempts = 0;
-            bool got_prompt = false;
-            
-            /* Wait up to 3 seconds (300 attempts × 10ms) */
-            while (attempts < 300 && !got_prompt)
-            {
-                ria_push_char(1);
-                ria_set_ax(g_tcp_fd);
+    unsigned int msg_len, topic_len, bytes_read;
+    int msg_count = 0;
+    int publish_total = 10;
+    int i, j;
+    volatile long k;
+    char broker[] = MQTT_BROKER_IP;    
+    char sub_topic[] = "rp6502_sub";    
 
-                if (ria_call_int(RIA_OP_READ_XSTACK))
-                {
-                    ch = ria_pop_char();
-                    
-                    /* Echo what we got while waiting */
-                    if (RIA.ready & RIA_READY_TX_BIT)
-                        RIA.tx = ch;
-                    
-                    /* Only look for >, ignore everything else */
-                    if (ch == '>')
-                    {
-                        got_prompt = true;
-                        tcp_print("\r\n[Got >]\r\n");
-                        break;
-                    }
-                }
-                else
-                {
-                    scheduler_sleep(10);
-                    scheduler_yield();
-                    attempts++;
-                }
-            }
-            
-            tcp_print("[After wait loop - got_prompt=");
-            if (got_prompt)
-                tcp_print("YES]\r\n");
-            else
-                tcp_print("NO]\r\n");
-            
-            if (!got_prompt)
-            {
-                tcp_print("ERROR: TIMEOUT waiting for > - skipping this message\r\n");
-                continue;
-            }
-        }
-        
-        tcp_print("[About to send data]\r\n");
-        
-        scheduler_sleep(10);
-        scheduler_yield();
-        
-        /* Send message data */
-        send_raw_data(g_tcp_fd, json_message, msg_len);
-        
-        /* Send \r\n terminator */
-        ria_push_char('\r');
-        ria_set_ax(g_tcp_fd);
-        while (!ria_call_int(RIA_OP_WRITE_XSTACK))
-            ;
-        ria_push_char('\n');
-        ria_set_ax(g_tcp_fd);
-        while (!ria_call_int(RIA_OP_WRITE_XSTACK))
-            ;
-        
-        tcp_print("[Data sent, waiting for SEND OK]\r\n");
-        
-        /* Wait for SEND OK confirmation */
-        {
-            char ch;
-            int attempts = 0;
-            bool got_send_ok = false;
-            static char ok_buffer[32];
-            int ok_idx = 0;
-            
-            ok_buffer[0] = '\0';
-            
-            /* Wait up to 5 seconds for SEND OK */
-            while (attempts < 500 && !got_send_ok)
-            {
-                ria_push_char(1);
-                ria_set_ax(g_tcp_fd);
-                
-                if (ria_call_int(RIA_OP_READ_XSTACK))
-                {
-                    ch = ria_pop_char();
-                    
-                    /* Echo */
-                    if (RIA.ready & RIA_READY_TX_BIT)
-                        RIA.tx = ch;
-                    
-                    /* Add to buffer */
-                    if (ok_idx < 31)
-                    {
-                        ok_buffer[ok_idx++] = ch;
-                        ok_buffer[ok_idx] = '\0';
-                    }
-                    
-                    /* Check for "OK" */
-                    if (my_strstr(ok_buffer, "OK"))
-                    {
-                        got_send_ok = true;
-                        tcp_print("\r\n[Got SEND OK]\r\n");
-                        break;
-                    }
-                    
-                    /* Keep buffer small */
-                    if (ok_idx > 20)
-                    {
-                        int i;
-                        for (i = 0; i < 10; i++)
-                            ok_buffer[i] = ok_buffer[ok_idx - 10 + i];
-                        ok_idx = 10;
-                        ok_buffer[ok_idx] = '\0';
-                    }
-                }
-                else
-                {
-                    scheduler_sleep(10);
-                    scheduler_yield();
-                    attempts++;
-                }
-            }
-            
-            if (!got_send_ok)
-            {
-                tcp_print("[WARNING: No SEND OK confirmation]\r\n");
-            }
-        }
-        
-        /* Track as sent */
-        tcp_tracker_mark_sent(&g_tcp_sent_tracker, msgId);
-        g_tcp_messages_sent++;
-        
-        tcp_print("SENT\r\n");
-        
-        /* Give receiver task time to process incoming response
-           Server typically responds within 100-500ms */
-        scheduler_sleep(3000);
-        scheduler_yield();
-    }
+    print("[5/6] Listening for incoming messages...\n");
+    printf("Waiting for %d messages to be received\n", g_tracked_count);
     
-    tcp_print("TCP Sender: All messages sent\r\n");
-    
-    /* Keep task alive */
-    for (;;)
-    {
-        scheduler_sleep(1000);
-        scheduler_yield();
-    }
-}
+    while (!all_messages_received()) {  /* 50 seconds max */
+        RIA.op = 0x35;  /* mq_poll */
 
-/* TCP Receiver Task - receives responses from server */
-static void tcp_receiver_task(void *arg)
-{
-    static char read_buffer[1024];
-    static int buf_pos = 0;
-    static ResponseMessage msg;
-    static int payload_remaining = 0;
-    static int idle_count = 0;
-    char ch;
-    char *json_start;
-    char *ipd_start;
-    char *colon;
-    int i;
-    int len;
-    
-    (void)arg;
-    
-    /* Wait for TCP initialization */
-    while (!g_tcp_initialized || g_tcp_fd < 0)
-    {
-        scheduler_sleep(500);
-        scheduler_yield();
-    }
-    
-    tcp_print("TCP Receiver: Starting\r\n");
-    
-    buf_pos = 0;
-    read_buffer[0] = '\0';
-    payload_remaining = 0;
-    idle_count = 0;
-    
-    for (;;)
-    {
-        /* Heartbeat every 100 idle reads to show receiver is active */
-        if (idle_count > 0 && idle_count % 100 == 0)
-        {
-            tcp_print("[R");
+        while (RIA.busy) { }            
+
+        msg_len = RIA.a | (RIA.x << 8);
+
+        /* Drain all pending messages before delaying again */
+        while (msg_len > 0) {
+            msg_count++;
+            printf("\n=== Message %d (Payload: %d bytes) ===\n", msg_count, msg_len);
+            
+            /* topic address */   
+            RIA.xstack = 0x0500 >> 8;    /* topic addr high */
+            RIA.xstack = 0x0500 & 0xFF;  /* topic addr low */
+            RIA.xstack = 128 >> 8;                                    
+            RIA.xstack = 128 & 0xFF; // buf len
+
+            RIA.op = 0x37;  /* mq_get_topic */
+            
+            while (RIA.busy) { }                
+
+            topic_len = RIA.a | (RIA.x << 8);
+            
+            printf("Topic: ");
+            RIA.addr0 = 0x0500;
+
+            for (j = 0; j < topic_len; j++) {
+                putchar(RIA.rw0);
+            }
+
+            printf("\n");
+            
+            /* Read message */
+            RIA.xstack = 0x0600 >> 8;    /* topic addr high */
+            RIA.xstack = 0x0600 & 0xFF;  /* topic addr low */
+            RIA.xstack = 255 >> 8;            
+            RIA.xstack = 255 & 0xFF; // buf len
+
+            RIA.op = 0x36;  /* mq_read_message */
+            
+            while (RIA.busy) { }                
+
+            bytes_read = RIA.a | (RIA.x << 8);
+            
+            printf("Payload: ");
+            RIA.addr0 = 0x0600;
+            RIA.step0 = 1;  // Enable auto-increment
+
+            printf("\n");
+            
+            /* Parse GUID from received message */
             {
-                char idle_str[12];
-                int idle_idx = 0;
-                int idle_temp = idle_count;
-                if (idle_temp == 0)
-                    idle_str[idle_idx++] = '0';
-                else
+                char *guid_start;
+                char guid_str[9];
+                unsigned int recv_guid_high = 0;
+                unsigned int recv_guid_low = 0;
+                int k;
+                static char payload_buf[512];
+                
+                /* Copy payload to buffer for parsing */
+                RIA.addr0 = 0x0600;
+                RIA.step0 = 1;
+
+                for (j = 0; j < bytes_read && j < 511; j++) {
+                    payload_buf[j] = RIA.rw0;
+                    putchar(payload_buf[j]);                    
+                }
+                
+                payload_buf[j] = '\0';
+                
+                /* Skip any leading control bytes (e.g., 0x00/0x0A) before JSON */
                 {
-                    char digits[12];
-                    int d_idx = 0;
-                    while (idle_temp > 0)
-                    {
-                        digits[d_idx++] = '0' + (idle_temp % 10);
-                        idle_temp /= 10;
+                    int start_idx;
+
+                    start_idx = 0;
+
+                    while (start_idx < bytes_read && payload_buf[start_idx] != '{')
+                        start_idx++;
+
+                    guid_start = my_strstr(&payload_buf[start_idx], "\"Guid\"");
+                }
+
+                if (guid_start)
+                {
+                    /* Move past "Guid" */
+                    guid_start += 6; /* length of "Guid" */
+
+                    /* Skip optional spaces and colon */
+                    while (*guid_start == ' ')
+                        guid_start++;
+                    if (*guid_start == ':')
+                        guid_start++;
+                    while (*guid_start == ' ')
+                        guid_start++;
+
+                    /* Expect opening quote */
+                    if (*guid_start == '"')
+                        guid_start++;
+                    
+                    /* Extract 8 hex characters */
+                    for (k = 0; k < 8 && guid_start[k] != '\0' && guid_start[k] != '\"'; k++) {
+                        guid_str[k] = guid_start[k];
                     }
-                    while (d_idx > 0)
-                        idle_str[idle_idx++] = digits[--d_idx];
-                }
-                idle_str[idle_idx] = '\0';
-                tcp_print(idle_str);
-            }
-            tcp_print("]");
-        }
-        
-        /* Try to read available characters */
-        ria_push_char(1);
-        ria_set_ax(g_tcp_fd);
-        if (ria_call_int(RIA_OP_READ_XSTACK))
-        {
-            ch = ria_pop_char();
-            
-            /* Echo character for debugging */
-            if (RIA.ready & RIA_READY_TX_BIT)
-                RIA.tx = ch;
-            
-            idle_count = 0;
-            
-            /* If we're collecting payload bytes after +IPD header */
-            if (payload_remaining > 0)
-            {
-                if (buf_pos < 1023)
-                {
-                    read_buffer[buf_pos++] = ch;
-                    read_buffer[buf_pos] = '\0';
-                }
-                payload_remaining--;
-                
-                if (payload_remaining == 0)
-                {
-                    tcp_print("\r\n[Receiver: Payload complete]\r\n");
-                }
-            }
-            else
-            {
-                /* Add to buffer (header or general data) */
-                if (buf_pos < 1023)
-                {
-                    read_buffer[buf_pos++] = ch;
-                    read_buffer[buf_pos] = '\0';
-                }
-                
-                /* Detect +IPD header for incoming data
-                   Format: "+IPD,<len>:<data>" */
-                if (buf_pos >= 10)
-                {
-                    ipd_start = my_strstr(read_buffer, "+IPD,");
-                    if (ipd_start)
-                    {
-                        /* Find the colon that separates length from data */
-                        colon = ipd_start + 5;  /* skip "+IPD," */
-                        while (*colon && *colon != ':')
-                            colon++;
+                    guid_str[k] = '\0';
+                    
+                    /* Parse hex string to GUID values */
+                    if (k == 8) {
+                        for (k = 0; k < 4; k++) {
+                            char c = guid_str[k];
+                            recv_guid_high = (recv_guid_high << 4);
+                            if (c >= '0' && c <= '9')
+                                recv_guid_high |= (c - '0');
+                            else if (c >= 'A' && c <= 'F')
+                                recv_guid_high |= (c - 'A' + 10);
+                            else if (c >= 'a' && c <= 'f')
+                                recv_guid_high |= (c - 'a' + 10);
+                        }
                         
-                        /* Only parse if we found the colon */
-                        if (*colon == ':')
-                        {
-                            len = parse_number(ipd_start + 5);
-                            if (len > 0)
-                            {
-                                tcp_print("\r\n[Receiver: Detected +IPD with ");
-                                {
-                                    char len_str[12];
-                                    int len_idx = 0;
-                                    int temp = len;
-                                    if (temp == 0)
-                                        len_str[len_idx++] = '0';
-                                    else
-                                    {
-                                        char digits[12];
-                                        int d_idx = 0;
-                                        while (temp > 0)
-                                        {
-                                            digits[d_idx++] = '0' + (temp % 10);
-                                            temp /= 10;
-                                        }
-                                        while (d_idx > 0)
-                                            len_str[len_idx++] = digits[--d_idx];
-                                    }
-                                    len_str[len_idx] = '\0';
-                                    tcp_print(len_str);
-                                }
-                                tcp_print(" bytes]\\r\\n");
-                                
-                                /* Reset buffer to store only payload (starts after ':') */
-                                buf_pos = 0;
-                                read_buffer[0] = '\0';
-                                payload_remaining = len;
-                                continue;
-                            }
+                        for (k = 4; k < 8; k++) {
+                            char c = guid_str[k];
+                            recv_guid_low = (recv_guid_low << 4);
+                            if (c >= '0' && c <= '9')
+                                recv_guid_low |= (c - '0');
+                            else if (c >= 'A' && c <= 'F')
+                                recv_guid_low |= (c - 'A' + 10);
+                            else if (c >= 'a' && c <= 'f')
+                                recv_guid_low |= (c - 'a' + 10);
                         }
-                    }
-                }
-            }
-            
-            /* Look for complete JSON objects */
-            if (ch == '}')
-            {
-                /* Search backwards for opening brace */
-                json_start = NULL;
-                for (i = buf_pos - 1; i >= 0; i--)
-                {
-                    if (read_buffer[i] == '{')
-                    {
-                        json_start = &read_buffer[i];
-                        break;
-                    }
-                }
-                
-                if (json_start)
-                {
-                    /* Try to parse JSON */
-                    tcp_print("\r\n[Receiver: Found JSON, attempting parse]\r\n");
-                    if (parse_json_response(json_start, &msg))
-                    {
-                        tcp_print("Receiver: Parsed ID ");
-                        {
-                            char id_str[12];
-                            int id_idx = 0;
-                            int temp = msg.id;
-                            
-                            if (temp == 0)
-                                id_str[id_idx++] = '0';
-                            else
-                            {
-                                char digits[12];
-                                int d_idx = 0;
-                                while (temp > 0)
-                                {
-                                    digits[d_idx++] = '0' + (temp % 10);
-                                    temp /= 10;
-                                }
-                                while (d_idx > 0)
-                                    id_str[id_idx++] = digits[--d_idx];
-                            }
-                            id_str[id_idx] = '\0';
-                            tcp_print(id_str);
-                        }
-                        tcp_print("\r\n");
                         
-                        /* Add to queue */
-                        if (!tcp_queue_put(&g_tcp_response_queue, &msg))
-                        {
-                            tcp_print("Receiver: Queue full!\r\n");
+                        printf("Received message GUID: %04X%04X\n", recv_guid_high, recv_guid_low);
+                        
+                        /* Mark as received */
+                        if (mark_received(recv_guid_high, recv_guid_low)) {
+                            printf("Message matched and marked received! (%d/%d)\n", 
+                                   count_received_messages(), g_tracked_count);
+                        } else {
+                            printf("Message GUID not in tracking list\n");
                         }
-                        else
-                        {
-                            g_tcp_responses_received++;
-                        }
-                    }
-                    
-                    /* Remove processed JSON from buffer */
-                    {
-                        int json_len = (buf_pos - (json_start - read_buffer));
-                        int remaining = buf_pos - (json_start - read_buffer) - json_len;
-                        if (remaining > 0)
-                        {
-                            for (i = 0; i < remaining; i++)
-                                read_buffer[i] = read_buffer[(json_start - read_buffer) + json_len + i];
-                        }
-                        buf_pos = remaining;
-                        read_buffer[buf_pos] = '\0';
                     }
                 }
-            }
-            
-            /* Prevent buffer overflow */
-            if (buf_pos > 800)
-            {
-                int keep = 512;
-                for (i = 0; i < keep; i++)
-                    read_buffer[i] = read_buffer[buf_pos - keep + i];
-                buf_pos = keep;
-                read_buffer[buf_pos] = '\0';
-            }
-        }
-        else
-        {
-            /* No data available */
-            idle_count++;
-            
-            /* If we're waiting for payload and it's taking too long, reset */
-            if (payload_remaining > 0 && idle_count > 500)
-            {
-                tcp_print("\r\n[Receiver: Timeout waiting for payload, resetting]\r\n");
-                payload_remaining = 0;
-                buf_pos = 0;
-                read_buffer[0] = '\0';
-                idle_count = 0;
-            }
-            
-            /* Sleep briefly then yield to other tasks */
-            scheduler_sleep(10);
-            scheduler_yield();
-        }
-    }
-}
-
-/* TCP Comparator Task - validates received responses */
-static void tcp_comparator_task(void *arg)
-{
-    ResponseMessage response;
-    int missing;
-    
-    (void)arg;
-    
-    /* Wait for TCP initialization */
-    while (!g_tcp_initialized || g_tcp_fd < 0)
-    {
-        scheduler_sleep(500);
-        scheduler_yield();
-    }
-    
-    tcp_print("TCP Comparator: Starting\r\n");
-    
-    for (;;)
-    {
-        /* Check if there are responses to process */
-        while (tcp_queue_get(&g_tcp_response_queue, &response))
-        {
-            tcp_print("Comparator: Validating ID ");
-            {
-                char id_str[12];
-                int id_idx = 0;
-                int temp = response.id;
-                
-                if (temp == 0)
-                    id_str[id_idx++] = '0';
                 else
                 {
-                    char digits[12];
-                    int d_idx = 0;
-                    while (temp > 0)
-                    {
-                        digits[d_idx++] = '0' + (temp % 10);
-                        temp /= 10;
-                    }
-                    while (d_idx > 0)
-                        id_str[id_idx++] = digits[--d_idx];
+                    printf("GUID not found in message payload\n");
                 }
-                id_str[id_idx] = '\0';
-                tcp_print(id_str);
             }
-            
-            /* Check if this message was actually sent */
-            if (tcp_tracker_mark_response(&g_tcp_sent_tracker, response.id))
-            {
-                tcp_print(" - VALID\r\n");
-            }
-            else
-            {
-                tcp_print(" - ERROR: Not in sent list!\r\n");
-            }
+
+            /* Poll again immediately to see if more messages are queued */
+            RIA.op = 0x35;  /* mq_poll */
+            while (RIA.busy) { }
+            msg_len = RIA.a | (RIA.x << 8);
         }
         
-        /* Periodically report status */
-        scheduler_sleep(5000);
-        
-        missing = tcp_tracker_get_missing_count(&g_tcp_sent_tracker);
-        
-        tcp_print("TCP Status: Sent=");
+        /* Progress indicator */
+        if (i % 20 == 0 && i > 0) {
+            printf(".");
+            fflush(stdout);
+        }
+   
+        if (all_messages_received())
         {
-            char buf[12];
-            int idx = 0;
-            int temp = g_tcp_messages_sent;
-            
-            if (temp == 0)
-                buf[idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    buf[idx++] = digits[--d_idx];
-            }
-            buf[idx] = '\0';
-            tcp_print(buf);
+            printf("\n\nAll messages received! Ending gracefully.\n");
         }
-        
-        tcp_print(" Recv=");
-        {
-            char buf[12];
-            int idx = 0;
-            int temp = g_tcp_responses_received;
-            
-            if (temp == 0)
-                buf[idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    buf[idx++] = digits[--d_idx];
-            }
-            buf[idx] = '\0';
-            tcp_print(buf);
-        }
-        
-        tcp_print(" Missing=");
-        {
-            char buf[12];
-            int idx = 0;
-            int temp = missing;
-            
-            if (temp == 0)
-                buf[idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    buf[idx++] = digits[--d_idx];
-            }
-            buf[idx] = '\0';
-            tcp_print(buf);
-        }
-        tcp_print("\r\n");
-        
-        if (missing == 0 && g_tcp_sent_tracker.count > 0 && g_tcp_messages_sent >= TCP_TEST_MSG_COUNT)
-        {
-            tcp_print("*** ALL MESSAGES RECEIVED AND VALIDATED! ***\r\n");
-        }
-        
-        scheduler_yield();
+
+        for (k = 0; k < 20000; k++);
     }
+    
+    printf("\n\nReceived %d message%s total\n", 
+           msg_count, msg_count == 1 ? "" : "s");
+    printf("Tracked/Matched: %d/%d messages\n\n", 
+           count_received_messages(), g_tracked_count);
+    
+    /* STEP 6: Disconnect */
+    printf("[6/6] Disconnecting from broker...\n");
+    RIA.op = 0x31;  /* mq_disconnect */
+    
+    if (RIA.a == 0) {
+        printf("Disconnected successfully!\n");
+    }
+    
+    printf("\n=== EXAMPLE COMPLETE ===\n");
+    printf("Summary:\n");
+    printf("  - Connected to %s\n", broker);
+    printf("  - Subscribed to: %s\n", sub_topic);
+    printf("  - Published 3 messages\n");
+    printf("  - Received %d messages\n", msg_count);
+    printf("  - Disconnected cleanly\n");
 }
 
 /* ========== End TCP UART Tasks ========== */
@@ -2225,15 +2102,22 @@ static void tcp_comparator_task(void *arg)
 void main()
 {
     unsigned int i;
+    int mqtt_ok;
 
     test_run_count = 0;
     scheduler_init();
-    /* Create and register an idle task so CPU accounting can exclude idle yields */
-    // {
-    //     int idle_id = scheduler_add(idle_task, NULL);
-    //     scheduler_set_idle_task(idle_id);
-    // }
-    
+    mqtt_ok = mqtt_init();
+
+    if (mqtt_ok != 0)
+    {
+        puts("MQTT initialization failed\r\n");
+        return;
+    }
+    else
+    {
+        puts("MQTT initialized successfully\r\n");
+    }
+
     /* Seed RNG with tick count so different runs have different sequences */
     seed_random(scheduler_get_ticks());
     
@@ -2246,26 +2130,23 @@ void main()
     q_init(&test_q_1);
     q_init(&test_q_2);
 
-    /* Initialize TCP UART tasks */
-    // tcp_print("Main: Initializing TCP UART tasks...\r\n");
-    // scheduler_add(tcp_init_task, NULL);
-    // scheduler_add(tcp_sender_task, NULL);
-    // scheduler_add(tcp_receiver_task, NULL);
-  //  scheduler_add(tcp_comparator_task, NULL);
+    // mqtt
+    scheduler_add(mqtt_producer_task, NULL);
+    scheduler_add(mqtt_consumer_task, NULL);
 
-    if (use_monitor == 1)
+    if (use_monitor == -1)
     {
         scheduler_add(task_a, NULL);
         scheduler_add(task_b, NULL);
-        scheduler_add(queue_test_producer, NULL);
-        scheduler_add(queue_test_consumer, NULL);
-        scheduler_add(queue_test_consumer, NULL);        
+        //scheduler_add(queue_test_producer, NULL);
+        //scheduler_add(queue_test_consumer, NULL);
+//        scheduler_add(queue_test_consumer, NULL);        
 
         scheduler_add(producer_task, NULL);
         scheduler_add(consumer_task_1, NULL);
         scheduler_add(consumer_task_2, NULL);        
         scheduler_add(task_monitor, NULL);        
-        scheduler_add(deep_stack_test, NULL);
+  //      scheduler_add(deep_stack_test, NULL);
     }
     // else
     // {
