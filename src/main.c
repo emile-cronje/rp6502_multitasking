@@ -1466,28 +1466,6 @@ static void consumer_task_2(void *arg)
     }
 }
 
-/* Idle task used to represent CPU idle time for accounting. */
-// static void consumer_task_1_old(void *arg)
-// {
-//     unsigned int v;
-//     volatile unsigned int *p = (volatile unsigned int *)arg;
-
-//     for (;;)
-//     {
-//         scheduler_sleep(sleep_ms_consumer);                
-
-//         if (q_pop(&q, &v)) {
-//             if (p) {
-//                 //printValue(v, "popped...: ");
-//                 *p = v;
-//                 printValue(consumed_item_1, "popped...: ");                
-//             }
-//         }
-
-//         scheduler_yield();
-//     }
-// }
-
 void task_monitor(void *arg)
 {
     char num_buffer[8];
@@ -2072,7 +2050,8 @@ static void mqtt_consumer_task(void *arg)
             printf("\n\nAll messages received! Ending gracefully.\n");
         }
 
-        for (k = 0; k < 20000; k++);
+        scheduler_sleep(1000);
+        scheduler_yield();
     }
     
     printf("\n\nReceived %d message%s total\n", 
@@ -2106,17 +2085,6 @@ void main()
 
     test_run_count = 0;
     scheduler_init();
-    mqtt_ok = mqtt_init();
-
-    if (mqtt_ok != 0)
-    {
-        puts("MQTT initialization failed\r\n");
-        return;
-    }
-    else
-    {
-        puts("MQTT initialized successfully\r\n");
-    }
 
     /* Seed RNG with tick count so different runs have different sequences */
     seed_random(scheduler_get_ticks());
@@ -2131,31 +2099,40 @@ void main()
     q_init(&test_q_2);
 
     // mqtt
-    scheduler_add(mqtt_producer_task, NULL);
-    scheduler_add(mqtt_consumer_task, NULL);
+  //  scheduler_add(mqtt_producer_task, NULL);
+//    scheduler_add(mqtt_consumer_task, NULL);
 
-    if (use_monitor == -1)
+    if (use_monitor == 1)
     {
         scheduler_add(task_a, NULL);
         scheduler_add(task_b, NULL);
-        //scheduler_add(queue_test_producer, NULL);
-        //scheduler_add(queue_test_consumer, NULL);
-//        scheduler_add(queue_test_consumer, NULL);        
+        scheduler_add(queue_test_producer, NULL);
+        scheduler_add(queue_test_consumer, NULL);
+        scheduler_add(queue_test_consumer, NULL);        
 
         scheduler_add(producer_task, NULL);
         scheduler_add(consumer_task_1, NULL);
         scheduler_add(consumer_task_2, NULL);        
         scheduler_add(task_monitor, NULL);        
-  //      scheduler_add(deep_stack_test, NULL);
+        scheduler_add(deep_stack_test, NULL);
     }
-    // else
-    // {
-    //     scheduler_add(queue_test_producer, NULL);
-    //     scheduler_add(queue_test_consumer, NULL);
-    //     scheduler_add(queue_test_consumer, NULL);        
-    // }
+    else
+    {
+        mqtt_ok = mqtt_init();
 
-//    scheduler_add_once(task_once, NULL);
-//    scheduler_add(mem_fluctuate_task, NULL);
+        if (mqtt_ok != 0)
+        {
+            puts("MQTT initialization failed\r\n");
+            return;
+        }
+        else
+        {
+            puts("MQTT initialized successfully\r\n");
+        }
+        scheduler_add(queue_test_producer, NULL);
+        scheduler_add(queue_test_consumer, NULL);
+        scheduler_add(queue_test_consumer, NULL);        
+    }
+
     scheduler_run();
 }
