@@ -8,6 +8,7 @@
 const unsigned int BATCH_SIZE = 500;    
 const unsigned int MAX_ITEM_COUNT = 2000;    
 const unsigned int use_monitor = 1u;
+volatile unsigned char mq_lock = 0;
 
 /* TCP UART Configuration */
 #define WIFI_SSID "Cudy24G"
@@ -17,14 +18,14 @@ const unsigned int use_monitor = 1u;
 #define MQTT_BROKER_IP "192.168.10.174"
 #define MQTT_BROKER_PORT "1883"
 #define TEST_MSG_LENGTH 1
-#define MAX_TRACKED_MESSAGES 10
+#define MAX_TRACKED_MESSAGES 50
+#define MQTT_PUBLISH_COUNT 50
 #define TCP_TEST_MSG_COUNT 1
 #define TCP_TEST_MSG_LENGTH 1
 #define TCP_BATCH_SIZE 10
 #define RESPONSE_BUFFER_SIZE 256
 #define COMMAND_TIMEOUT 10000
-#define RESPONSE_QUEUE_SIZE 10
-#define SENT_MESSAGE_TRACKING_SIZE 50    
+
 void scheduler_sleep(unsigned short ticks);
 void scheduler_yield(void);
 
@@ -75,6 +76,7 @@ typedef struct {
 
 static TrackedMessage g_message_tracker[MAX_TRACKED_MESSAGES];
 static int g_tracked_count = 0;
+static int g_expected_message_count = 0;
 static unsigned long g_guid_counter = 0;
 static int g_msgId = 1;
 
@@ -86,13 +88,6 @@ typedef struct {
     char base64_hash[64];
     bool valid;
 } ResponseMessage;
-
-typedef struct {
-    ResponseMessage messages[RESPONSE_QUEUE_SIZE];
-    int write_idx;
-    int read_idx;
-    int count;
-} ResponseQueue;
 
 typedef struct {
     int id;
@@ -107,7 +102,6 @@ typedef struct {
 } MessageTracker;
 
 /* TCP UART Global State */
-static ResponseQueue g_tcp_response_queue;
 static MessageTracker g_tcp_sent_tracker;
 static int g_tcp_fd = -1;
 static int g_tcp_msgId = 1;
@@ -129,6 +123,13 @@ unsigned int scheduler_memory_usage(void);
 
 /* Simple pseudo-random generator (linear congruential method) */
 static unsigned int random_seed = 42u;
+
+static void mq_acquire(void) {
+    while (mq_lock) scheduler_yield();
+    mq_lock = 1;
+}
+
+static void mq_release(void) { mq_lock = 0; }
 
 void generate_guid(unsigned int *high, unsigned int *low)
 {
@@ -490,7 +491,6 @@ int mqtt_init(void)
     unsigned int sub_len;
     char pub_topic1[] = "rp6502_pub";
     int msg_count = 0;
-    int publish_total = 10;
 
     /* STEP 1: Connect to WiFi */
     print("[1/6] Connecting to WiFi...\n");
@@ -568,7 +568,7 @@ int mqtt_init(void)
     RIA.xstack = 0x0200 & 0xFF;    
     RIA.xstack = sub_len >> 8;    
     RIA.xstack = sub_len & 0xFF;
-    RIA.xstack = 1;                 // QoS 1    
+    RIA.xstack = 0;                 // QoS 1    
     RIA.op = 0x33;  // mq_subscribe
 
     while (RIA.busy) { }    
@@ -594,25 +594,6 @@ static void send_raw_data(int fd, char *data, int length)
         while (!ria_call_int(RIA_OP_WRITE_XSTACK))
             ;
     }
-}
-
-/* Response queue operations */
-static void tcp_queue_init(ResponseQueue *q)
-{
-    q->write_idx = 0;
-    q->read_idx = 0;
-    q->count = 0;
-}
-
-static bool tcp_queue_put(ResponseQueue *q, ResponseMessage *msg)
-{
-    if (q->count >= RESPONSE_QUEUE_SIZE)
-        return false;
-    
-    q->messages[q->write_idx] = *msg;
-    q->write_idx = (q->write_idx + 1) % RESPONSE_QUEUE_SIZE;
-    q->count++;
-    return true;
 }
 
 /* Message tracker operations */
@@ -755,6 +736,11 @@ int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *ou
     int i;
     char id_str[12];
     int id_idx;
+    
+    /* Clear buffers to prevent stale data from previous calls */
+    for (i = 0; i < 512; i++) base64_msg[i] = 0;
+    for (i = 0; i < 64; i++) base64_hash[i] = 0;
+    for (i = 0; i < 32; i++) hash[i] = 0;
     
     // Get message length
     msg_len = 0;
@@ -1101,6 +1087,15 @@ static void deep_stack_test(void *arg)
     for (;;) scheduler_yield();
 }
 
+/* Idle task to keep ticks advancing when all other tasks are sleeping. */
+static void idle_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        scheduler_yield();
+    }
+}
+
 static void producer_task(void *arg)
 {
     unsigned int val = 0;
@@ -1383,8 +1378,8 @@ static void queue_test_producer(void *arg)
             }
         }
 
-        for (i = 0; i < 1000u; ++i)
-            scheduler_yield();
+        //for (i = 0; i < 1000u; ++i)
+        scheduler_yield();
     }
 }
 
@@ -1409,16 +1404,6 @@ static void queue_test_consumer(void *arg)
 
                 test_recv_count++;
                 test_recv_sum += (unsigned long)v;
-                /* Debug: print first few pops and periodic progress */
-                // if (test_recv_count <= 5 || (test_recv_count % 500) == 0) {
-                //     itoa_new(test_recv_count, buf);
-                //     puts("Consumer: popped count:");
-                //     puts(buf);
-                //     itoa_new(v, buf);
-                //     puts("Consumer: popped val:");
-                //     puts(buf);
-                // }
-                /* After each pop, yield to allow producer to run */
                 scheduler_yield();
             }
             /* Check if done: producer finished AND queue is empty */
@@ -1426,9 +1411,9 @@ static void queue_test_consumer(void *arg)
                 //puts("Consumer: detected producer done and empty queue");
                 break;
             }
+
             scheduler_yield();
         }
-
     }
 }
 
@@ -1487,17 +1472,14 @@ void task_monitor(void *arg)
 
     for (;;)
     {
-        // if (test_run_count == 0)
-        // {
-        //     continue;
-        // }
-
         scheduler_sleep(1000);
         toggle_counter++;
+
         /* Toggle mem_fluctuate_active every 10 monitor cycles */
         if (toggle_counter % 10 == 0) {
             mem_fluctuate_active = !mem_fluctuate_active;
         }
+
         puts("------------------------\r\n");
         sb_pos = 0;
         append_fmt(summary_buffer, sizeof(summary_buffer), &sb_pos, "--- Task Summary ---\r\n");
@@ -1739,14 +1721,10 @@ void task_monitor(void *arg)
         }
     }
 
-    /* print assembled summary (includes memory/stack and queue lines appended above) */
     puts(summary_buffer);
   //      puts("\r\n");                        
     }
 }
-
-/* old monitor kept for reference removed to avoid duplicate code and warnings */
-
 
 int track_message(unsigned int guid_high, unsigned int guid_low)
 {
@@ -1778,18 +1756,6 @@ bool mark_received(unsigned int guid_high, unsigned int guid_low)
     return false;
 }
 
-/* Check if all messages received */
-bool all_messages_received(void)
-{
-    int i;
-    for (i = 0; i < g_tracked_count; i++)
-    {
-        if (g_message_tracker[i].sent && !g_message_tracker[i].received)
-            return false;
-    }
-    return true;
-}
-
 /* Count received messages */
 int count_received_messages(void)
 {
@@ -1803,25 +1769,37 @@ int count_received_messages(void)
     return count;
 }
 
+/* Check if all messages received */
+bool all_messages_received(void)
+{
+    int received = count_received_messages();
+    return (received >= g_expected_message_count);
+}
+
 static void mqtt_producer_task(void *arg)
 {
-    int publish_total;    
-    int i, j;
-    volatile long k;
-    unsigned int msg_len, topic_len, bytes_read;
-    static char test_message[512];    
-    static char json_message[1024];    
+    /* ALL state must be static to avoid 256-byte stack overflow */
+    static char test_message[512];
+    static char json_message[1024];
     static char sent_base64_msg[512];
     static char sent_base64_hash[64];
-    char pub_topic1[] = "rp6502_pub";    
+    static char pub_topic1[] = "rp6502_pub";
+    static int publish_total;
+    static int i;
+    static unsigned int msg_guid_high, msg_guid_low;
+    
+    (void)arg;    
 
     print("[4/6] Publishing messages...\n");
 
-    publish_total = 10;
+    publish_total = MQTT_PUBLISH_COUNT;
+    g_expected_message_count = publish_total;
 
     for (i = 0; i < publish_total; i++) {
-        unsigned int msg_guid_high, msg_guid_low;
-        
+        printf("Producer: iteration %d, acquiring lock...\n", i + 1);
+        mq_acquire();
+        printf("Producer: lock acquired\n");
+
         build_formatted_msg(i + 1, TEST_MSG_LENGTH, test_message, 512);    
         build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash, &msg_guid_high, &msg_guid_low);
         
@@ -1833,6 +1811,12 @@ static void mqtt_producer_task(void *arg)
         xram_strcpy(0x0400, json_message);
         
         printf("Publishing (%d/%d): %s -> %s\n", i + 1, publish_total, pub_topic1, json_message);
+        
+        /* Debug: print message length for last few messages */
+        if (i + 1 >= publish_total - 2) {
+            printf("  Message length: %d bytes\n", (int)strlen(json_message));
+            printf("  Topic length: %d bytes\n", (int)strlen(pub_topic1));
+        }
         //printf("Topic and message len: %zu -> %zu\n", strlen(pub_topic1), strlen(json_message));    
         
         /* payload address */   
@@ -1852,7 +1836,7 @@ static void mqtt_producer_task(void *arg)
         RIA.xstack = strlen(pub_topic1) & 0xFF;
 
         RIA.xstack = 1;                              /* retain = false */    
-        RIA.xstack = 1;                              /* QoS 1 */    
+        RIA.xstack = 0;                              /* QoS 0 */    
 
         // Kick off publish
         RIA.op = 0x32;  // mq_publish
@@ -1868,30 +1852,52 @@ static void mqtt_producer_task(void *arg)
             print("ERROR: Publish failed\n");
         }
 
-        scheduler_sleep(1000);
-        scheduler_yield();
+        mq_release();
+        printf("Producer: lock released, sleeping...\n");
+        scheduler_sleep(500);
+        printf("Producer: woke up from sleep\n");
     }
+    printf("Producer: completed all %d publishes\n", publish_total);
 }
 
 static void mqtt_consumer_task(void *arg)
 {
-    unsigned int msg_len, topic_len, bytes_read;
-    int msg_count = 0;
-    int publish_total = 10;
-    int i, j;
-    volatile long k;
-    char broker[] = MQTT_BROKER_IP;    
-    char sub_topic[] = "rp6502_sub";    
+    /* ALL state must be static to avoid 256-byte stack overflow */
+    static char broker[] = MQTT_BROKER_IP;
+    static char sub_topic[] = "rp6502_sub";
+    static unsigned int msg_len, topic_len, bytes_read;
+    static int msg_count = 0;
+    static int i, j;
+    static int poll_attempts = 0;
+    static const int MAX_POLL_ATTEMPTS = 100;  /* ~50 seconds at 500ms sleep */
+    
+    (void)arg;    
 
     print("[5/6] Listening for incoming messages...\n");
-    printf("Waiting for %d messages to be received\n", g_tracked_count);
+    printf("Waiting for %d messages to be received\n", g_expected_message_count);
     
-    while (!all_messages_received()) {  /* 50 seconds max */
+    while (!all_messages_received() && poll_attempts < MAX_POLL_ATTEMPTS) {
+        printf("Consumer: checking for messages, acquiring lock...\n");
+        mq_acquire();
+        printf("Consumer: lock acquired\n");
         RIA.op = 0x35;  /* mq_poll */
 
         while (RIA.busy) { }            
 
         msg_len = RIA.a | (RIA.x << 8);
+
+        /* If no message, release lock immediately and sleep */
+        if (msg_len == 0) {
+            printf("Consumer: no message, releasing lock and sleeping...\n");
+            mq_release();
+            poll_attempts++;
+            scheduler_sleep(500);
+            printf("Consumer: woke up from sleep\n");
+            continue;
+        }
+        
+        /* Reset poll attempts when we get a message */
+        poll_attempts = 0;
 
         /* Drain all pending messages before delaying again */
         while (msg_len > 0) {
@@ -1939,12 +1945,13 @@ static void mqtt_consumer_task(void *arg)
             
             /* Parse GUID from received message */
             {
+                static char payload_buf[512];
+                static char guid_str[9];
                 char *guid_start;
-                char guid_str[9];
                 unsigned int recv_guid_high = 0;
                 unsigned int recv_guid_low = 0;
                 int k;
-                static char payload_buf[512];
+                int start_idx;
                 
                 /* Copy payload to buffer for parsing */
                 RIA.addr0 = 0x0600;
@@ -1958,16 +1965,12 @@ static void mqtt_consumer_task(void *arg)
                 payload_buf[j] = '\0';
                 
                 /* Skip any leading control bytes (e.g., 0x00/0x0A) before JSON */
-                {
-                    int start_idx;
+                start_idx = 0;
 
-                    start_idx = 0;
+                while (start_idx < bytes_read && payload_buf[start_idx] != '{')
+                    start_idx++;
 
-                    while (start_idx < bytes_read && payload_buf[start_idx] != '{')
-                        start_idx++;
-
-                    guid_start = my_strstr(&payload_buf[start_idx], "\"Guid\"");
-                }
+                guid_start = my_strstr(&payload_buf[start_idx], "\"Guid\"");
 
                 if (guid_start)
                 {
@@ -2050,8 +2053,15 @@ static void mqtt_consumer_task(void *arg)
             printf("\n\nAll messages received! Ending gracefully.\n");
         }
 
-        scheduler_sleep(1000);
-        scheduler_yield();
+        mq_release();        
+        scheduler_sleep(500);
+    }
+    
+    if (all_messages_received()) {
+        printf("\n\nAll messages received! Ending gracefully.\n");
+    } else {
+        printf("\n\nTimeout: Only received %d/%d messages after %d poll attempts.\n", 
+               count_received_messages(), g_expected_message_count, MAX_POLL_ATTEMPTS);
     }
     
     printf("\n\nReceived %d message%s total\n", 
@@ -2071,7 +2081,7 @@ static void mqtt_consumer_task(void *arg)
     printf("Summary:\n");
     printf("  - Connected to %s\n", broker);
     printf("  - Subscribed to: %s\n", sub_topic);
-    printf("  - Published 3 messages\n");
+    printf("  - Published %d messages\n", g_tracked_count);
     printf("  - Received %d messages\n", msg_count);
     printf("  - Disconnected cleanly\n");
 }
@@ -2094,16 +2104,12 @@ void main()
         pseudo_random(0u, 1u);
     }
 
-    /* Ensure test queues are initialized regardless of monitor mode */
-    q_init(&test_q_1);
-    q_init(&test_q_2);
-
-    // mqtt
-  //  scheduler_add(mqtt_producer_task, NULL);
-//    scheduler_add(mqtt_consumer_task, NULL);
-
-    if (use_monitor == 1)
+    if (use_monitor == -1)
     {
+        /* Ensure test queues are initialized regardless of monitor mode */
+        q_init(&test_q_1);
+        q_init(&test_q_2);
+
         scheduler_add(task_a, NULL);
         scheduler_add(task_b, NULL);
         scheduler_add(queue_test_producer, NULL);
@@ -2129,9 +2135,10 @@ void main()
         {
             puts("MQTT initialized successfully\r\n");
         }
-        scheduler_add(queue_test_producer, NULL);
-        scheduler_add(queue_test_consumer, NULL);
-        scheduler_add(queue_test_consumer, NULL);        
+
+        scheduler_add(mqtt_producer_task, NULL);
+        scheduler_add(mqtt_consumer_task, NULL);
+        scheduler_add(idle_task, NULL);        
     }
 
     scheduler_run();
