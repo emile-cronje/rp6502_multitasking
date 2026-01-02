@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "pubsub.h"
 #include <stddef.h> /* For NULL */
 #include <stdlib.h> /* For malloc and free */
 #include <rp6502.h>
@@ -7,7 +8,7 @@
 
 const unsigned int BATCH_SIZE = 500;    
 const unsigned int MAX_ITEM_COUNT = 2000;    
-const unsigned int use_monitor = 1u;
+unsigned int use_monitor = 1u;
 volatile unsigned char mq_lock = 0;
 
 /* TCP UART Configuration */
@@ -19,7 +20,7 @@ volatile unsigned char mq_lock = 0;
 //#define MQTT_BROKER_IP "192.168.10.135"
 #define MQTT_BROKER_PORT "1883"
 #define TEST_MSG_LENGTH 1
-#define MQTT_PUBLISH_COUNT 500
+#define MQTT_PUBLISH_COUNT 10
 #define TCP_TEST_MSG_COUNT 1
 #define TCP_TEST_MSG_LENGTH 1
 #define TCP_BATCH_SIZE 10
@@ -109,6 +110,9 @@ static volatile bool g_tcp_initialized = false;
 static volatile bool g_tcp_send_in_progress = false;
 static volatile unsigned int g_tcp_messages_sent = 0;
 static volatile unsigned int g_tcp_responses_received = 0;
+
+/* Pub/Sub Manager for multi-topic messaging */
+static PubSubManager g_pubsub_mgr;
 
 /* Approximate total RAM available for the OS (matches rp6502.cfg:
     RAM start = $0200, size = $FD00 - __STACKSIZE__ where __STACKSIZE__ is $0800
@@ -1095,6 +1099,97 @@ static void idle_task(void *arg)
         scheduler_yield();
     }
 }
+
+/* ==================== PUB/SUB EXAMPLE TASKS ==================== */
+
+/* Callback for temperature topic */
+static void on_temperature_update(const char *topic, unsigned int message, void *user_data)
+{
+    printf("[TEMP_SUBSCRIBER] Received on topic '%s': temp=%u°C\n", topic, message);
+    (void)user_data;
+}
+
+/* Callback for pressure topic */
+static void on_pressure_update(const char *topic, unsigned int message, void *user_data)
+{
+    printf("[PRESSURE_SUBSCRIBER] Received on topic '%s': pressure=%u kPa\n", topic, message);
+    (void)user_data;
+}
+
+/* Callback for system status topic */
+static void on_system_status(const char *topic, unsigned int message, void *user_data)
+{
+    printf("[STATUS_SUBSCRIBER] Received on topic '%s': status=0x%04X\n", topic, message);
+    (void)user_data;
+}
+
+/* Publisher task that sends temperature and pressure readings */
+static void pubsub_sensor_publisher(void *arg)
+{
+    unsigned int temp_value = 20;
+    unsigned int pressure_value = 1013;
+    unsigned int iteration = 0;
+    
+    (void)arg;
+    
+    printf("[PUBLISHER] Starting sensor publisher task\n");
+    
+    for (;;) {
+        iteration++;
+        
+        /* Simulate temperature change */
+        temp_value = 20 + (iteration % 10);
+        
+        /* Simulate pressure change */
+        pressure_value = 1010 + (iteration % 20);
+        
+        /* Publish to temperature topic */
+        if (pubsub_publish(&g_pubsub_mgr, "sensors/temperature", temp_value)) {
+            printf("[PUBLISHER] Published temp=%u to 'sensors/temperature'\n", temp_value);
+        } else {
+            printf("[PUBLISHER] FAILED to publish temperature\n");
+        }
+        
+        /* Publish to pressure topic */
+        if (pubsub_publish(&g_pubsub_mgr, "sensors/pressure", pressure_value)) {
+            printf("[PUBLISHER] Published pressure=%u to 'sensors/pressure'\n", pressure_value);
+        } else {
+            printf("[PUBLISHER] FAILED to publish pressure\n");
+        }
+        
+        /* Publish system status every 5 iterations */
+        if (iteration % 5 == 0) {
+            unsigned int status = 0x0001 | (iteration << 8);
+            if (pubsub_publish(&g_pubsub_mgr, "system/status", status)) {
+                printf("[PUBLISHER] Published status=0x%04X to 'system/status'\n", status);
+            }
+        }
+        
+        scheduler_sleep(500);
+    }
+}
+
+/* Subscriber task that processes sensor messages */
+static void pubsub_sensor_monitor(void *arg)
+{
+    (void)arg;
+    
+    printf("[MONITOR] Starting sensor monitor task\n");
+    
+    for (;;) {
+        /* Process all pending messages from all topics */
+        pubsub_process_all(&g_pubsub_mgr);
+        
+        printf("[MONITOR] Queue sizes: temp=%u, pressure=%u, status=%u\n",
+               pubsub_queue_size(&g_pubsub_mgr, "sensors/temperature"),
+               pubsub_queue_size(&g_pubsub_mgr, "sensors/pressure"),
+               pubsub_queue_size(&g_pubsub_mgr, "system/status"));
+        
+        scheduler_sleep(300);
+    }
+}
+
+/* ==================== END PUB/SUB EXAMPLE TASKS ==================== */
 
 static void producer_task(void *arg)
 {
@@ -2104,6 +2199,8 @@ void main()
         pseudo_random(0u, 1u);
     }
 
+    use_monitor = 1;
+
     if (use_monitor == -1)
     {
         /* Ensure test queues are initialized regardless of monitor mode */
@@ -2124,21 +2221,37 @@ void main()
     }
     else
     {
-        mqtt_ok = mqtt_init();
-
-        if (mqtt_ok != 0)
-        {
-            puts("MQTT initialization failed\r\n");
-            return;
-        }
-        else
-        {
-            puts("MQTT initialized successfully\r\n");
-        }
-
-        scheduler_add(mqtt_producer_task, NULL);
-        scheduler_add(mqtt_consumer_task, NULL);
-        scheduler_add(idle_task, NULL);        
+        /* Initialize pub/sub system for multi-topic messaging */
+        printf("\n[MAIN] Initializing pub/sub system...\n");
+        pubsub_init(&g_pubsub_mgr);
+        
+        /* Create topics */
+//        pubsub_create_topic(&g_pubsub_mgr, "sensors/temperature");
+        //pubsub_create_topic(&g_pubsub_mgr, "sensors/pressure");
+        pubsub_create_topic(&g_pubsub_mgr, "rp6502_pub");
+        
+        printf("[MAIN] Subscribing to topics...\n");
+        
+        /* Subscribe to temperature topic */
+        //pubsub_subscribe(&g_pubsub_mgr, "sensors/temperature", 
+                        //on_temperature_update, NULL);
+        
+        /* Subscribe to pressure topic */
+        //pubsub_subscribe(&g_pubsub_mgr, "sensors/pressure", 
+                        //on_pressure_update, NULL);
+        
+        /* Subscribe to system status topic */
+        pubsub_subscribe(&g_pubsub_mgr, "rp6502_pub", 
+                        on_system_status, NULL);
+        
+        printf("[MAIN] Pub/Sub initialized with 3 topics and 3 subscribers\n\n");
+        
+        /* Add pub/sub demonstration tasks */
+        scheduler_add(pubsub_sensor_publisher, NULL);
+        scheduler_add(pubsub_sensor_monitor, NULL);
+        scheduler_add(idle_task, NULL);
+        
+        printf("[MAIN] Pub/Sub tasks added to scheduler. Starting...\n\n");
     }
 
     scheduler_run();

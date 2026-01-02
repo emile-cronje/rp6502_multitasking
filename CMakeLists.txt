@@ -45,6 +45,7 @@ set(C_SOURCES
   ${OS_SRC_DIR}/scheduler.c
   ${OS_SRC_DIR}/ringq.c
   ${OS_SRC_DIR}/string_helpers.c
+  ${OS_SRC_DIR}/pubsub.c
 )
 set(ASM_SOURCES
   ${OS_SRC_DIR}/ctxswitch.s
