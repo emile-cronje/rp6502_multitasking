@@ -8,10 +8,11 @@
 
 const unsigned int BATCH_SIZE = 500;    
 const unsigned int MAX_ITEM_COUNT = 2000;    
-unsigned int use_monitor = 1u;
 volatile unsigned char mq_lock = 0;
 
-/* TCP UART Configuration */
+#define USE_MONITOR 0
+#define USE_PUBSUB_ONLY 0
+#define USE_MQTT_ONLY 1
 #define WIFI_SSID "Cudy24G"
 #define WIFI_PASSWORD "ZAnne19991214"
 #define SERVER_IP "192.168.10.250"
@@ -1100,72 +1101,44 @@ static void idle_task(void *arg)
     }
 }
 
-/* ==================== PUB/SUB EXAMPLE TASKS ==================== */
-
-/* Callback for temperature topic */
-static void on_temperature_update(const char *topic, unsigned int message, void *user_data)
+static void on_rp6502(const char *topic, unsigned int message, void *user_data)
 {
-    printf("[TEMP_SUBSCRIBER] Received on topic '%s': temp=%u°C\n", topic, message);
+    printf("[STATUS_SUBSCRIBER] Received on topic '%s': rp_6502=0x%04X\n", topic, message);
     (void)user_data;
 }
 
-/* Callback for pressure topic */
-static void on_pressure_update(const char *topic, unsigned int message, void *user_data)
+/* Bridge task that polls MQTT and publishes to pubsub */
+static void mqtt_to_pubsub_bridge(void *arg)
 {
-    printf("[PRESSURE_SUBSCRIBER] Received on topic '%s': pressure=%u kPa\n", topic, message);
-    (void)user_data;
-}
-
-/* Callback for system status topic */
-static void on_system_status(const char *topic, unsigned int message, void *user_data)
-{
-    printf("[STATUS_SUBSCRIBER] Received on topic '%s': status=0x%04X\n", topic, message);
-    (void)user_data;
-}
-
-/* Publisher task that sends temperature and pressure readings */
-static void pubsub_sensor_publisher(void *arg)
-{
-    unsigned int temp_value = 20;
-    unsigned int pressure_value = 1013;
-    unsigned int iteration = 0;
+    static unsigned int msg_len;
+    static unsigned int msg_value;
     
     (void)arg;
     
-    printf("[PUBLISHER] Starting sensor publisher task\n");
+    printf("[BRIDGE] Starting MQTT to PubSub bridge task\n");
     
     for (;;) {
-        iteration++;
+        /* Poll for MQTT messages */
+        RIA.op = 0x35;  /* mq_poll */
+        while (RIA.busy) { }
         
-        /* Simulate temperature change */
-        temp_value = 20 + (iteration % 10);
+        msg_len = RIA.a | (RIA.x << 8);
         
-        /* Simulate pressure change */
-        pressure_value = 1010 + (iteration % 20);
-        
-        /* Publish to temperature topic */
-        if (pubsub_publish(&g_pubsub_mgr, "sensors/temperature", temp_value)) {
-            printf("[PUBLISHER] Published temp=%u to 'sensors/temperature'\n", temp_value);
-        } else {
-            printf("[PUBLISHER] FAILED to publish temperature\n");
-        }
-        
-        /* Publish to pressure topic */
-        if (pubsub_publish(&g_pubsub_mgr, "sensors/pressure", pressure_value)) {
-            printf("[PUBLISHER] Published pressure=%u to 'sensors/pressure'\n", pressure_value);
-        } else {
-            printf("[PUBLISHER] FAILED to publish pressure\n");
-        }
-        
-        /* Publish system status every 5 iterations */
-        if (iteration % 5 == 0) {
-            unsigned int status = 0x0001 | (iteration << 8);
-            if (pubsub_publish(&g_pubsub_mgr, "system/status", status)) {
-                printf("[PUBLISHER] Published status=0x%04X to 'system/status'\n", status);
+        if (msg_len > 0) {
+            printf("[BRIDGE] MQTT message received (%u bytes), publishing to pubsub\n", msg_len);
+            
+            /* Read the message value (simplified - just use msg_len as the value for demo) */
+            msg_value = msg_len;
+            
+            /* Publish to pubsub system */
+            if (pubsub_publish(&g_pubsub_mgr, "rp6502_sub", msg_value)) {
+                printf("[BRIDGE] Published value %u to 'rp6502_sub' topic\n", msg_value);
+            } else {
+                printf("[BRIDGE] FAILED to publish to pubsub (queue full?)\n");
             }
         }
         
-        scheduler_sleep(500);
+        scheduler_sleep(100);  /* Poll every 100ms */
     }
 }
 
@@ -1177,19 +1150,14 @@ static void pubsub_sensor_monitor(void *arg)
     printf("[MONITOR] Starting sensor monitor task\n");
     
     for (;;) {
-        /* Process all pending messages from all topics */
         pubsub_process_all(&g_pubsub_mgr);
         
-        printf("[MONITOR] Queue sizes: temp=%u, pressure=%u, status=%u\n",
-               pubsub_queue_size(&g_pubsub_mgr, "sensors/temperature"),
-               pubsub_queue_size(&g_pubsub_mgr, "sensors/pressure"),
-               pubsub_queue_size(&g_pubsub_mgr, "system/status"));
+        printf("[MONITOR] Queue sizes: rp6502_sub=%u\n",
+               pubsub_queue_size(&g_pubsub_mgr, "rp6502_sub"));
         
         scheduler_sleep(300);
     }
 }
-
-/* ==================== END PUB/SUB EXAMPLE TASKS ==================== */
 
 static void producer_task(void *arg)
 {
@@ -1332,12 +1300,6 @@ static void queue_test_producer(void *arg)
 
         test_run_count++;                 
 
-        if (use_monitor == 0) {
-            itoa_new(test_run_count, buf, sizeof(buf));
-            puts("Test run starting:");
-            puts(buf);
-        }        
-
         /* Quick runtime sanity check: ensure test_q and q buffers don't overlap */
         {
             unsigned int *a_start = (unsigned int *)&test_q_2.buf[0];
@@ -1363,14 +1325,6 @@ static void queue_test_producer(void *arg)
         }
 
         test_total_item_count = pseudo_random(100u, MAX_ITEM_COUNT);
-
-        // if (use_monitor == 1)
-        // {
-        //     itoa_new(test_total_item_count, buf, sizeof(buf));
-        //     puts("Test Queue: total items:");
-        //     puts(buf);
-        // }        
-
         test_start_ticks = scheduler_get_ticks();
 
         i = 0;
@@ -1411,9 +1365,9 @@ static void queue_test_producer(void *arg)
             }
         }
 
-        if (use_monitor == 0)
+        if (false)
         {
-                itoa_new(test_sent_count, buf, sizeof(buf));
+            itoa_new(test_sent_count, buf, sizeof(buf));
             puts("\r\nQueue test: producer sent:");
             puts(buf);
                 itoa_new(test_recv_count, buf, sizeof(buf));
@@ -1892,7 +1846,7 @@ static void mqtt_producer_task(void *arg)
 
     for (i = 0; i < publish_total; i++) {
         printf("Producer: iteration %d, acquiring lock...\n", i + 1);
-        mq_acquire();
+        //mq_acquire();
         printf("Producer: lock acquired\n");
 
         build_formatted_msg(i + 1, TEST_MSG_LENGTH, test_message, 512);    
@@ -1947,7 +1901,7 @@ static void mqtt_producer_task(void *arg)
             print("ERROR: Publish failed\n");
         }
 
-        mq_release();
+        //mq_release();
         printf("Producer: lock released, sleeping...\n");
         scheduler_sleep(500);
         printf("Producer: woke up from sleep\n");
@@ -1973,7 +1927,7 @@ static void mqtt_consumer_task(void *arg)
     
     while (!all_messages_received() && poll_attempts < MAX_POLL_ATTEMPTS) {
         printf("Consumer: checking for messages, acquiring lock...\n");
-        mq_acquire();
+        //mq_acquire();
         printf("Consumer: lock acquired\n");
         RIA.op = 0x35;  /* mq_poll */
 
@@ -1984,7 +1938,7 @@ static void mqtt_consumer_task(void *arg)
         /* If no message, release lock immediately and sleep */
         if (msg_len == 0) {
             printf("Consumer: no message, releasing lock and sleeping...\n");
-            mq_release();
+          //mq_release();
             poll_attempts++;
             scheduler_sleep(500);
             printf("Consumer: woke up from sleep\n");
@@ -2148,7 +2102,7 @@ static void mqtt_consumer_task(void *arg)
             printf("\n\nAll messages received! Ending gracefully.\n");
         }
 
-        mq_release();        
+        //mq_release();        
         scheduler_sleep(500);
     }
     
@@ -2199,11 +2153,7 @@ void main()
         pseudo_random(0u, 1u);
     }
 
-    use_monitor = 1;
-
-    if (use_monitor == -1)
-    {
-        /* Ensure test queues are initialized regardless of monitor mode */
+    #if USE_MONITOR == 1
         q_init(&test_q_1);
         q_init(&test_q_2);
 
@@ -2217,42 +2167,47 @@ void main()
         scheduler_add(consumer_task_1, NULL);
         scheduler_add(consumer_task_2, NULL);        
         scheduler_add(task_monitor, NULL);        
-        scheduler_add(deep_stack_test, NULL);
-    }
-    else
-    {
-        /* Initialize pub/sub system for multi-topic messaging */
+        scheduler_add(deep_stack_test, NULL);    
+    #endif
+
+    #if USE_PUBSUB_ONLY == 1
         printf("\n[MAIN] Initializing pub/sub system...\n");
         pubsub_init(&g_pubsub_mgr);
-        
-        /* Create topics */
-//        pubsub_create_topic(&g_pubsub_mgr, "sensors/temperature");
-        //pubsub_create_topic(&g_pubsub_mgr, "sensors/pressure");
         pubsub_create_topic(&g_pubsub_mgr, "rp6502_pub");
         
         printf("[MAIN] Subscribing to topics...\n");
-        
-        /* Subscribe to temperature topic */
-        //pubsub_subscribe(&g_pubsub_mgr, "sensors/temperature", 
-                        //on_temperature_update, NULL);
-        
-        /* Subscribe to pressure topic */
-        //pubsub_subscribe(&g_pubsub_mgr, "sensors/pressure", 
-                        //on_pressure_update, NULL);
-        
-        /* Subscribe to system status topic */
+
         pubsub_subscribe(&g_pubsub_mgr, "rp6502_pub", 
                         on_system_status, NULL);
         
-        printf("[MAIN] Pub/Sub initialized with 3 topics and 3 subscribers\n\n");
-        
-        /* Add pub/sub demonstration tasks */
-        scheduler_add(pubsub_sensor_publisher, NULL);
         scheduler_add(pubsub_sensor_monitor, NULL);
         scheduler_add(idle_task, NULL);
-        
-        printf("[MAIN] Pub/Sub tasks added to scheduler. Starting...\n\n");
-    }
+       
+    #endif      
+
+    #if USE_MQTT_ONLY == 1
+        mqtt_ok = mqtt_init();
+
+        if (mqtt_ok != 0)
+        {
+            puts("MQTT initialization failed\r\n");
+            return;
+        }
+        else
+        {
+            puts("MQTT initialized successfully\r\n");
+        }
+
+        pubsub_init(&g_pubsub_mgr);
+        pubsub_create_topic(&g_pubsub_mgr, "rp6502_sub");        
+        pubsub_subscribe(&g_pubsub_mgr, "rp6502_sub", on_rp6502, NULL);
+
+        scheduler_add(mqtt_producer_task, NULL);
+        scheduler_add(mqtt_to_pubsub_bridge, NULL);  /* Bridge task polls MQTT and publishes to pubsub */
+        scheduler_add(pubsub_sensor_monitor, NULL);        
+        //scheduler_add(mqtt_consumer_task, NULL);
+        scheduler_add(idle_task, NULL);
+    #endif
 
     scheduler_run();
 }
