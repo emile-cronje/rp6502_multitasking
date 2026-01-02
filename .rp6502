@@ -1,4 +1,4 @@
 [RP6502]
-device = /dev/ttyACM4
+device = /dev/ttyACM2
 term = True
 

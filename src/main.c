@@ -16,10 +16,10 @@ volatile unsigned char mq_lock = 0;
 #define SERVER_IP "192.168.10.250"
 #define SERVER_PORT "8080"
 #define MQTT_BROKER_IP "192.168.10.174"
+//#define MQTT_BROKER_IP "192.168.10.135"
 #define MQTT_BROKER_PORT "1883"
 #define TEST_MSG_LENGTH 1
-#define MAX_TRACKED_MESSAGES 100
-#define MQTT_PUBLISH_COUNT 100
+#define MQTT_PUBLISH_COUNT 500
 #define TCP_TEST_MSG_COUNT 1
 #define TCP_TEST_MSG_LENGTH 1
 #define TCP_BATCH_SIZE 10
@@ -74,7 +74,7 @@ typedef struct {
     bool received;
 } TrackedMessage;
 
-static TrackedMessage g_message_tracker[MAX_TRACKED_MESSAGES];
+static TrackedMessage g_message_tracker[MQTT_PUBLISH_COUNT];
 static int g_tracked_count = 0;
 static int g_expected_message_count = 0;
 static unsigned long g_guid_counter = 0;
@@ -1728,7 +1728,7 @@ void task_monitor(void *arg)
 
 int track_message(unsigned int guid_high, unsigned int guid_low)
 {
-    if (g_tracked_count >= MAX_TRACKED_MESSAGES)
+    if (g_tracked_count >= MQTT_PUBLISH_COUNT)
         return -1;
     
     g_message_tracker[g_tracked_count].guid_high = guid_high;
