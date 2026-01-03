@@ -1112,6 +1112,8 @@ static void mqtt_to_pubsub_bridge(void *arg)
 {
     static unsigned int msg_len;
     static unsigned int msg_value;
+    static unsigned int payload_addr;
+    static unsigned int payload_len;
     
     (void)arg;
     
@@ -1125,10 +1127,23 @@ static void mqtt_to_pubsub_bridge(void *arg)
         msg_len = RIA.a | (RIA.x << 8);
         
         if (msg_len > 0) {
-            printf("[BRIDGE] MQTT message received (%u bytes), publishing to pubsub\n", msg_len);
+            printf("[BRIDGE] MQTT message received (%u bytes)\n", msg_len);
             
-            /* Read the message value (simplified - just use msg_len as the value for demo) */
-            msg_value = msg_len;
+            /* Read the actual message to consume it from the MQTT queue */
+            /* Set up buffer at 0x0600 for message payload */
+            RIA.xstack = 0x0600 >> 8;    /* payload addr high */
+            RIA.xstack = 0x0600 & 0xFF;  /* payload addr low */
+            RIA.xstack = 255 >> 8;       /* buffer size high */
+            RIA.xstack = 255 & 0xFF;     /* buffer size low */
+            
+            RIA.op = 0x36;  /* mq_read_message - THIS CONSUMES THE MESSAGE */
+            while (RIA.busy) { }
+            
+            payload_len = RIA.a | (RIA.x << 8);
+            printf("[BRIDGE] Read message: %u bytes from MQTT\n", payload_len);
+            
+            /* Use message length as the value for pubsub */
+            msg_value = payload_len;
             
             /* Publish to pubsub system */
             if (pubsub_publish(&g_pubsub_mgr, "rp6502_sub", msg_value)) {
@@ -1136,27 +1151,47 @@ static void mqtt_to_pubsub_bridge(void *arg)
             } else {
                 printf("[BRIDGE] FAILED to publish to pubsub (queue full?)\n");
             }
+            
+            /* Keep polling to see if there are more messages queued */
+        } else {
+            /* No message, sleep to avoid busy-polling */
+            scheduler_sleep(100);
         }
-        
-        scheduler_sleep(100);  /* Poll every 100ms */
     }
 }
 
 /* Subscriber task that processes sensor messages */
-static void pubsub_sensor_monitor(void *arg)
+static void pubsub_monitor(void *arg)
 {
+    static unsigned int empty_count = 0;
+    static const unsigned int EMPTY_THRESHOLD = 3;  /* 3 cycles with empty queue = stop */
+    unsigned int queue_size;
+    
     (void)arg;
     
-    printf("[MONITOR] Starting sensor monitor task\n");
+    printf("[MONITOR] Starting pubsub monitor task\n");
     
     for (;;) {
         pubsub_process_all(&g_pubsub_mgr);
         
-        printf("[MONITOR] Queue sizes: rp6502_sub=%u\n",
-               pubsub_queue_size(&g_pubsub_mgr, "rp6502_sub"));
+        queue_size = pubsub_queue_size(&g_pubsub_mgr, "rp6502_sub");
+        printf("[MONITOR] Queue sizes: rp6502_sub=%u\n", queue_size);
+        
+        /* Track empty cycles */
+        if (queue_size == 0) {
+            empty_count++;
+            if (empty_count >= EMPTY_THRESHOLD) {
+                printf("[MONITOR] Queue empty for %u cycles. Exiting monitor task.\n", empty_count);
+                break;
+            }
+        } else {
+            empty_count = 0;  /* Reset counter if queue has messages */
+        }
         
         scheduler_sleep(300);
     }
+    
+    printf("[MONITOR] Monitor task completed\n");
 }
 
 static void producer_task(void *arg)
@@ -2203,9 +2238,9 @@ void main()
         pubsub_subscribe(&g_pubsub_mgr, "rp6502_sub", on_rp6502, NULL);
 
         scheduler_add(mqtt_producer_task, NULL);
-        scheduler_add(mqtt_to_pubsub_bridge, NULL);  /* Bridge task polls MQTT and publishes to pubsub */
-        scheduler_add(pubsub_sensor_monitor, NULL);        
-        //scheduler_add(mqtt_consumer_task, NULL);
+        scheduler_add(mqtt_to_pubsub_bridge, NULL);
+        scheduler_add(pubsub_monitor, NULL);        
+        scheduler_add(mqtt_consumer_task, NULL);
         scheduler_add(idle_task, NULL);
     #endif
 
